@@ -8,7 +8,7 @@
 #' @export
 #' @method summary bMap.cifti
 summary.bMap.cifti <- function(object, ...) {
-  bMap_params <- lapply(
+  BBM_params <- lapply(
     object$params,
     function(q) {
       if (is.null(q)) { q <- "NULL"};
@@ -18,7 +18,7 @@ summary.bMap.cifti <- function(object, ...) {
 
   x <- c(
     summary(object$subjNet_mean),
-    bMap_params
+    BBM_params
   )
 
   class(x) <- "summary.bMap.cifti"
@@ -35,7 +35,7 @@ summary.bMap.cifti <- function(object, ...) {
 #' @export
 #' @method summary bMap.nifti
 summary.bMap.nifti <- function(object, ...) {
-  bMap_params <- lapply(
+  BBM_params <- lapply(
     object$params,
     function(q) {
       if (is.null(q)) { q <- "NULL"};
@@ -49,7 +49,7 @@ summary.bMap.nifti <- function(object, ...) {
       nV=nrow(object$prior_mean),
       nL=ncol(object$prior_mean)
     ),
-    bMap_params
+    BBM_params
   )
 
   class(x) <- "summary.bMap.nifti"
@@ -66,7 +66,7 @@ summary.bMap.nifti <- function(object, ...) {
 #' @export
 #' @method summary bMap.matrix
 summary.bMap.matrix <- function(object, ...) {
-  bMap_params <- lapply(
+  BBM_params <- lapply(
     object$params,
     function(q) {
       if (is.null(q)) { q <- "NULL"};
@@ -76,7 +76,7 @@ summary.bMap.matrix <- function(object, ...) {
 
   x <- c(
     list(nV=nrow(object$subjNet_mean), nL=ncol(object$subjNet_mean)),
-    bMap_params
+    BBM_params
   )
 
   class(x) <- "summary.bMap.matrix"
@@ -86,7 +86,7 @@ summary.bMap.matrix <- function(object, ...) {
 #' @rdname summary.bMap.cifti
 #' @export
 #'
-#' @param x The result of \code{BrainMap} with CIFTI data
+#' @param x The result of \code{\link{fit_BBM}} with CIFTI data
 #' @param ... further arguments passed to or from other methods.
 #' @return Nothing, invisibly.
 #' @method print summary.bMap.cifti
@@ -95,7 +95,7 @@ print.summary.bMap.cifti <- function(x, ...) {
   cat("Temporal Res.:   ", x$TR, "s.\n")
   cat("Highpass filter: ", x$hpf, "Hz\n")
   cat("Spatial scaling: ", x$scale, "\n")
-  cat("Variance method: ", x$tvar_method, "\n")
+  cat("Variance method: ", x$var_method, "\n")
   cat("Q2 and Q2_max:   ", paste0(x$Q2, ", ", x$Q2_max), "\n")
   cat("-------------------------------------\n")
   cat("FC model:        ", x$FC, "\n")
@@ -127,7 +127,7 @@ print.summary.bMap.nifti <- function(x, ...) {
   cat("Temporal Res.:   ", x$TR, "s.\n")
   cat("Highpass filter: ", x$hpf, "Hz\n")
   cat("Spatial scaling: ", x$scale, "\n")
-  cat("Variance method: ", x$tvar_method, "\n")
+  cat("Variance method: ", x$var_method, "\n")
   cat("Q2 and Q2_max:   ", paste0(x$Q2, ", ", x$Q2_max), "\n")
   cat("-------------------------------------\n")
   cat("FC model:        ", x$FC, "\n")
@@ -157,7 +157,7 @@ print.summary.bMap.matrix <- function(x, ...) {
   cat("Temporal Res.:   ", x$TR, "s.\n")
   cat("Highpass filter: ", x$hpf, "Hz\n")
   cat("Spatial scaling: ", x$scale, "\n")
-  cat("Variance method: ", x$tvar_method, "\n")
+  cat("Variance method: ", x$var_method, "\n")
   cat("Q2 and Q2_max:   ", paste0(x$Q2, ", ", x$Q2_max), "\n")
   cat("-------------------------------------\n")
   cat("FC model:        ", x$FC, "\n")
@@ -200,116 +200,151 @@ print.bMap.matrix <- function(x, ...) {
   print.summary.bMap.matrix(summary(x))
 }
 
-#' Plot BrainMap estiamte
+#' Plot fit_BBM estiamte
 #'
-#' @param x The result of \code{BrainMap} with CIFTI data
-#' @param stat \code{"mean"} (default) or \code{"se"}.
-#' @param maps Show the BrianMap estimates on the brain? Default: \code{TRUE}.
-#' @param FC Show the FC estimates? Default: \code{TRUE}. Note that only the
-#'  mean estimate is available for FC, not the SE.
-#' @param ... Additional arguments to \code{view_xifti}
+#' @param x The result of \code{\link{fit_BBM}} with CIFTI data
+#' @param what The \code{"maps"} (default) on the brain, or the \code{"FC"} 
+#'  matrix. If both are desired, use two separate \code{plot} calls to first
+#'  plot the maps and then plot the FC.
+#' 
+#'  If \code{"FC"}, the default color scale will be from blue (-1) to red (1).
+#'  This can be changed with the \code{colFUN} argument to 
+#'  \code{\link[fMRItools]{plot_FC_gg}}.
+#' @param stat \code{"mean"} (default) or \code{"se"}. Note that for the FC,
+#'  only the mean estimate is available, not the SE.
+#' @param ... Additional arguments to \code{\link[ciftiTools]{view_xifti}} 
+#'  if \code{what=="maps"}, or \code{\link[fMRItools]{plot_FC_gg}} if 
+#'  \code{what=="FC"}.
 #' @return The plot
 #' @export
 #' @method plot bMap.cifti
 plot.bMap.cifti <- function(x,
+  what=c("maps", "FC"),
   stat=c("mean", "se"),
-  maps=TRUE,
-  FC=TRUE,
   ...) {
+  
   stopifnot(inherits(x, "bMap.cifti"))
 
   if (!requireNamespace("ciftiTools", quietly = TRUE)) {
     stop("Package \"ciftiTools\" needed to work with CIFTI data. Please install it.", call. = FALSE)
   }
 
+  what <- match.arg(what, c("maps", "FC"))
   stat <- match.arg(stat, c("mean", "se"))
-  stopifnot(isTRUE(maps) || isFALSE(maps))
-  stopifnot(isTRUE(FC) || isFALSE(FC))
-  if (!maps && !FC) { return(invisible(NULL)) }
-  if (stat=="se" && !maps) {
-    message("No FC SE, and maps==FALSE, so nothing to plot.")
-    return(invisible(NULL))
+  if (stat=="se" && what=="FC") {
+    stop("SE for FC is not available.")
   }
-
 
   # Check `...`
   args <- list(...)
   has_title <- "title" %in% names(args)
   has_idx <- "idx" %in% names(args)
   has_fname <- "fname" %in% names(args)
+  has_labs <- "labs" %in% names(args)
 
   # Print message saying what's happening.
-  msg1 <- ifelse(has_idx,
+  msg1 <- ifelse(has_idx || what=="FC",
     "Plotting the",
-    "Plotting the first component's"
+    "Plotting the first network's"
   )
   msg2 <- switch(stat,
-    mean=if (FC) { "mean estimate of the maps and FC." } else { "mean estimate of the maps." },
-    se="standard error of the maps."
+    mean="mean estimate of the",
+    se="standard error of the"
   )
-  cat(msg1, msg2, "\n")
+  msg3 <- switch(what,
+    maps="spatial map",
+    FC="FC"
+  )
+  cat(msg1, msg2, paste0(msg3, ".\n"))
 
   # Plot
-  out <- list()
+  if (what == "FC" && is.null(x$FC)) {
+    stop("`what=='FC'` but there's no FC prior.")
+  }
 
-  for (plt in c("map" , "FC")) {
-    if (plt == "map" && !maps) { next }
-    if (plt == "FC" && is.null(x$FC)) { next }
-    if (plt == "FC" && !FC) { next }
-    if (plt == "FC" && stat=="se") { next }
+  ss <- stat
+  ss2 <- ss
+  if (what == "FC") { ss2 <- paste0(ss2, "_FC") }
 
-    ss <- stat
-    args_ss <- args
-    tsfx_ss <- c(mean="", se=" (se)")[ss]
-    # Handle title and idx
+  args_ss <- args
+  tsfx_ss <- switch(ss, mean="", se=" (se)")
+  # Handle title and idx
+  if (what == "maps") {
+    ### No title: use the network names if available, and the indices if not.
     if (!has_title) {
       if (has_idx) {
         c1name <- if (!is.null(x$subjNet_mean$meta$cifti$names)) {
           x$subjNet_mean$meta$cifti$names[args$idx]
         } else {
-          paste("Component", args$idx)
+          paste("Network", args$idx)
         }
       } else {
         c1name <- if (!is.null(x$subjNet_mean$meta$cifti$names)) {
           x$subjNet_mean$meta$cifti$names[1]
         } else {
-          "First component"
+          "First network"
         }
       }
       args_ss$title <- paste0(c1name, tsfx_ss)
     } else if (!has_idx) {
       args_ss$title <- paste0(args_ss$title, tsfx_ss)
     }
-    # Handle fname
-    if (has_fname) {
-      fext <- if (grepl("html$", args_ss$fname[1])) {
-        "html"
-      } else if (grepl("pdf$", args_ss$fname[1])) {
-        "pdf"
-      } else {
-        "png"
-      }
-      args_ss$fname <- gsub(paste0(".", fext), "", args_ss$fname, fixed=TRUE)
-      args_ss$fname <- paste0(args_ss$fname, "_", ss, ".", fext)
-    }
-
-    if (plt == "map") {
-      out[[paste0(ss, "_map")]] <- do.call(
-        ciftiTools::view_xifti, c(list(x[[paste0("subjNet_", ss)]]), args_ss)
-      )
-      if (inherits(out[[paste0(ss, "_map")]], "htmlwidget")) { print(out[[paste0(ss, "_map")]]) }
-    } else if (plt == "FC") {
-      out[[paste0(ss, "_FC")]]  <- fMRItools::plot_FC_gg(x$FC$mean, title="FC mean", diagVal=NULL)
-      print(out[[paste0(ss, "_FC")]])
+  } else {
+    if (has_title) {
+      args_ss$title <- paste0(args_ss$title, tsfx_ss)
+    } else {
+      args_ss$title <- "FC mean"
     }
   }
+
+  # Handle fname
+  if (has_fname) {
+    fext <- if (grepl("html$", args_ss$fname[1])) {
+      "html"
+    } else if (grepl("pdf$", args_ss$fname[1])) {
+      "pdf"
+    } else {
+      "png"
+    }
+    args_ss$fname <- gsub(paste0(".", fext), "", args_ss$fname, fixed=TRUE)
+    args_ss$fname <- paste0(args_ss$fname, "_", ss, ".", fext)
+  }
+
+  if (what == "maps") {
+    out <- do.call(
+      ciftiTools::view_xifti, c(list(x[[paste0("subjNet_", ss)]]), args_ss)
+    )
+    if (inherits(out, "htmlwidget")) { print(out) }
+  } else if (what == "FC") {
+    if (!has_labs) {
+      net_names <- x$subjNet_mean$meta$cifti$names
+      args_ss$labs <- net_names
+    }
+    if (!("diagVal" %in% names(args_ss)) && stat!="mean") { args_ss$diagVal <- 0 }
+    if (!("colFUN" %in% names(args_ss)) && stat=="mean") {
+      if (!requireNamespace("ggplot2", quietly = TRUE)) {
+        stop("Package \"ggplot2\" needed to read NIFTI data. Please install it.", call. = FALSE)
+      }
+        if (!requireNamespace("grDevices", quietly = TRUE)) {
+        stop("Package \"grDevices\" needed to read NIFTI data. Please install it.", call. = FALSE)
+      }
+      gvals <- grDevices::hcl.colors(3, palette="Blue-Red2")
+      args_ss$colFUN <- function(limits=c(-1,1), ...){
+        ggplot2::scale_fill_gradient2(low=gvals[1], mid=gvals[2], high=gvals[3], limits=limits, ...)
+      }
+    }
+    out <- do.call(
+      fMRItools::plot_FC_gg, c(list(x$FC$mean), args_ss)
+    )
+    print(out)
+  } else { stop() }
 
   invisible(out)
 }
 
 #' Plot prior
 #'
-#' @param x The result of \code{BrainMap} with NIFTI data
+#' @param x The result of \code{\link{fit_BBM}} with NIFTI data
 #' @param stat \code{"mean"} (default), \code{"se"}
 #' @param plane,n_slices,slices Anatomical plane and which slice indices to show.
 #'  Default: 9 axial slices.
@@ -356,7 +391,7 @@ plot.bMap.nifti <- function(x, stat=c("mean", "se"),
   # Print message saying what's happening.
   msg1 <- ifelse(has_idx,
     "Plotting the",
-    "Plotting the first component's"
+    "Plotting the first network's"
   )
   msg2 <- switch(stat,
     mean="estimate.",
@@ -415,7 +450,7 @@ plot.bMap.nifti <- function(x, stat=c("mean", "se"),
   args_ss$plane <- plane
   # Handle title and idx
   if (!has_title && !has_idx) {
-    c1name <- "First component"
+    c1name <- "First network"
   }
   if (has_title) { stop("Not supported yet.") }
   if (has_fname) { stop("Not supported yet. Call `pdf` or `png` beforehand, and then `dev.off`.") }
@@ -429,7 +464,7 @@ plot.bMap.nifti <- function(x, stat=c("mean", "se"),
 #'
 #' This feature is not supported yet.
 #'
-#' @param x The result of \code{BrainMap} with NIFTI data
+#' @param x The result of \code{\link{fit_BBM}} with NIFTI data
 #' @param ... Additional arguments
 #' @return Nothing, because an error is raised.
 #' @export

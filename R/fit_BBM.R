@@ -14,12 +14,12 @@
 #'  regression estimate.
 #' @param prior Prior estimates in a format compatible with \code{BOLD},
 #'  from \code{\link{estimate_prior}}.
-#' @param tvar_method Which calculation of the prior variance to use:
+#' @param var_method Which calculation of the prior variance to use:
 #'  \code{"non-negative"} (default) or \code{"unbiased"}. The unbiased prior
 #'  variance is based on the assumed mixed effects/ANOVA model, whereas the
 #'  non-negative prior variance adds to it to account for greater potential
 #'  between-subjects variation. (The prior mean is the same for either choice
-#'  of \code{tvar_method}.)
+#'  of \code{var_method}.)
 #' @param GSR Center BOLD across columns (each image)? This
 #'  is equivalent to performing global signal regression. Default:
 #'  \code{"prior"}, to use the same option used for estimation of the
@@ -71,10 +71,12 @@
 #'  resolution of the data, i.e. the time between volumes, in seconds;
 #'  \code{hpf} is the frequency of the high-pass filter, in Hertz. Detrending
 #'  is performed via nuisance regression of DCT bases. Default:
-#'  \code{"prior"} to use the values from the prior. Be sure to set the
-#'  correct \code{TR} if it's different for the new data compared to the data
-#'  used in \code{estimate_prior}.
-#'
+#'  \code{"prior"} to use the values from the prior. Set \code{hpf} to \code{0}
+#'  to disable the high-pass filter. 
+#' 
+#'  Be sure to set the correct \code{TR} if it's different for the new data 
+#'  compared to the data used in \code{estimate_prior}.
+#' 
 #'  Note that if multiple \code{BOLD} sessions are provided, their
 #'  \code{TR} and \code{hpf} must be the same; both arguments accept only one
 #'  value.
@@ -201,11 +203,11 @@
 #' @examples
 #' \dontrun{
 #'  tm <- estimate_prior(cii1_fnames, cii2_fnames, gICA_fname, usePar=FALSE)
-#'  BrainMap(newcii_fname, tm, spatial_model=TRUE, resamp_res=2000, usePar=FALSE)
+#'  fit_BBM(newcii_fname, tm, spatial_model=TRUE, resamp_res=2000, usePar=FALSE)
 #' }
-BrainMap <- function(
+fit_BBM <- function(
   BOLD, prior,
-  tvar_method=c("non-negative", "unbiased"),
+  var_method=c("non-negative", "unbiased"),
   #tinds=NULL,
   scale=c("prior", "global", "local", "none"),
   scale_sm_surfL=NULL, 
@@ -263,6 +265,7 @@ BrainMap <- function(
   if (is.null(TR)) { TR <- "from_xifti_metadata" }
   stopifnot(length(TR)==1) # be explicit, diff TR for multi-BOLD is not allowed
   if (TR == "prior") { TR <- prior$params$TR }
+  if (is.null(hpf)) { hpf <- 0 }
   stopifnot(length(hpf)==1) # be explicit, diff TR for multi-BOLD is not allowed
   if (hpf == "prior") { hpf <- prior$params$hpf }
   if (GSR == "prior") {
@@ -276,14 +279,14 @@ BrainMap <- function(
     if (is.null(covariates)) {
       stop("These covariates were used during prior estimation: ", 
         paste0(covariate_names, collapse=", "), ". They must also be provided ", 
-        "to `BrainMap` with the `covariates` argument.")
+        "to `fit_BBM` with the `covariates` argument.")
     }
     stopifnot(is.numeric(covariates) && is.vector(covariates))
     stopifnot(length(covariates) == length(covariate_names))
     if(!all(names(covariates) == covariate_names)) {
       stop("These covariates were used during prior estimation: ", 
         paste0(covariate_names, collapse=", "), ". The same covariates must ", 
-        "also be provided to `BrainMap` with the `covariates` argument. ",
+        "also be provided to `fit_BBM` with the `covariates` argument. ",
         "However, the names for `covariates` provided here differ.")
     }
   } else {
@@ -305,8 +308,8 @@ BrainMap <- function(
   if (varTol == "prior") { varTol <- prior$params$varTol }
 
   # Remaining simple argument checks.
-  tvar_method <- match.arg(tvar_method, c("non-negative", "unbiased"))
-  tvar_name <- switch(tvar_method, `non-negative`="varNN", unbiased="varUB")
+  var_method <- match.arg(var_method, c("non-negative", "unbiased"))
+  tvar_name <- switch(var_method, `non-negative`="varNN", unbiased="varUB")
   if (is.null(scale) || isFALSE(scale)) { scale <- "none" }
   if (isTRUE(scale)) {
     warning(
@@ -318,7 +321,6 @@ BrainMap <- function(
   stopifnot(is_1(scale_sm_FWHM, "numeric"))
   if (is.list(nuisance)) { stopifnot(length(nuisance)==nN) }
   if (is.list(scrub)) { stopifnot(length(scrub)==nN) }
-  if (is.null(hpf)) { hpf <- 0 }
   stopifnot(is_1(drop_first, "numeric") && drop_first==round(drop_first))
   if (TR!= "from_xifti_metadata") { stopifnot(fMRItools::is_posNum(TR)) }
   stopifnot(fMRItools::is_posNum(hpf, zero_ok=TRUE))
@@ -514,17 +516,21 @@ BrainMap <- function(
   if(method_FC == "VB1"){
     if('FC' %in% names(prior$prior)) {
       do_FC <- TRUE
-      prior_FC <- prior$prior$FC
-      prior$prior$FC <- prior$prior$FC_Chol <- NULL
+      prior_FC <- prior$prior$FC$empirical
+      prior_FC$nu <- prior$prior$FC$IW$nu
+      prior_FC$psi <- prior$prior$FC$IW$psi
+      prior$prior$FC <- NULL
     } else {
       warning("FC information not available in `prior`.  I will set `method_FC` to 'none' and perform standard prior ICA.")
       method_FC <- "none"
     }
   } else if(method_FC == "VB2"){
-    if('FC_Chol' %in% names(prior$prior)) {
+    if('Chol' %in% names(prior$prior$FC)) {
       do_FC <- TRUE
-      prior_FC <- prior$prior$FC_Chol
-      prior$prior$FC <- prior$prior$FC_Chol <- NULL
+      prior_FC <- prior$prior$FC$Chol
+      prior_FC$nu <- prior$prior$FC$IW$nu
+      prior_FC$psi <- prior$prior$FC$IW$psi
+      prior$prior$FC <- NULL
     } else {
       warning("Cholesky FC information not available in `prior`.  I will set `method_FC` to 'none' and perform standard prior ICA.")
       method_FC <- "none"
@@ -609,8 +615,8 @@ BrainMap <- function(
     nI <- nrow(prior$prior$mean)
   }
 
-  # Get IC inds.
-  IC_inds <- prior$params$inds
+  # Get network indices.
+  net_inds <- prior$params$inds
 
   # Get the data mask based on missing values, & low variance locations
   mask2 <- prior$mask
@@ -710,8 +716,8 @@ BrainMap <- function(
       }
     }
     if (!is.list(meshes)) stop('`meshes` must be a list.')
-    if (!all(vapply(meshes, inherits, what="BrainMap_mesh", FALSE))) {
-      stop('Each element of `meshes` should be of class `"BrainMap_mesh"`. See `help(make_mesh)`.')
+    if (!all(vapply(meshes, inherits, what="BBM_mesh", FALSE))) {
+      stop('Each element of `meshes` should be of class `"BBM_mesh"`. See `help(make_mesh)`.')
     }
     ndat_mesh <- sum(vapply(meshes, function(x){sum(x$A)}, 0))
     if (ndat_mesh != nV) {
@@ -1019,11 +1025,11 @@ BrainMap <- function(
 
   verbose0 <- verbose
   if (verbose) {
-    if (do_spatial | do_FC) {
+    if (do_spatial || do_FC) {
       cat("Initializing with standard Bayesian brain mapping.\n")
       verbose <- FALSE
     }
-    if (!do_spatial & !do_FC) { cat("Computing Bayesian brain mapping.\n") }
+    if (!do_spatial && !do_FC) { cat("Computing Bayesian brain mapping.\n") }
   }
 
   if(do_spatial) {
@@ -1068,7 +1074,7 @@ BrainMap <- function(
 
   theta00 <- theta0
   theta00$nu0_sq <- err_var
-  result <- EM_BrainMap.independent(
+  result <- EM_BBM.independent(
     prior_mean=prior$mean,
     prior_var=prior$var,
     BOLD=BOLD2,
@@ -1107,7 +1113,7 @@ BrainMap <- function(
       doParallel::stopImplicitCluster()
     }
 
-    result <- VB_FCBrainMap(
+    result <- VB_FC_BBM(
         prior_mean = prior$mean,
         prior_var = prior$var,
         prior_FC = prior_FC,
@@ -1139,7 +1145,7 @@ BrainMap <- function(
     theta0$kappa <- rep(kappa_init, nL)
     if(verbose) cat('ESTIMATING SPATIAL MODEL\n')
     t000 <- Sys.time()
-    result <- EM_BrainMap.spatial(prior$mean,
+    result <- EM_BBM.spatial(prior$mean,
                                         prior$var,
                                         meshes,
                                         BOLD=BOLD2,
@@ -1190,13 +1196,13 @@ BrainMap <- function(
   # }
 
   # Params
-  bMap_params <- list(
+  BBM_params <- list(
     GSR=GSR,
     scale=scale, hpf=hpf, TR=TR,
     Q2=Q2, Q2_max=Q2_max, Q2_est=Q2_est,
     covariate_names=covariate_names,
     brainstructures=brainstructures,
-    tvar_method=tvar_method,
+    var_method=var_method,
     spatial_model=do_spatial,
     rm_mwall=rm_mwall,
     reduce_dim=reduce_dim,
@@ -1219,7 +1225,7 @@ BrainMap <- function(
 
   if (FORMAT %in% c("CIFTI", "GIFTI") && !is.null(xii1)) {
     xiiL <- ciftiTools::select_xifti(xii1, rep(1, nL))
-    xiiL <- ciftiTools::convert_to_dscalar(xiiL, names=paste("IC", IC_inds))
+    xiiL <- ciftiTools::convert_to_dscalar(xiiL, names=paste("Network", net_inds))
     result$subjNet_mean <- ciftiTools::newdata_xifti(xiiL, result$subjNet_mean)
     result$subjNet_se <- ciftiTools::newdata_xifti(xiiL, result$subjNet_se)
 
@@ -1261,7 +1267,7 @@ BrainMap <- function(
   result$BOLD <- BOLD
   result$mask <- mask2
   result$nuisance <- nmat
-  result$params <- bMap_params
+  result$params <- BBM_params
 
   #record computation time of each algorithm
   result$comptime <- c(as.numeric(t1, units = "secs"),

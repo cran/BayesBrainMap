@@ -3,12 +3,13 @@
 #' Identify areas of engagement in each network from the result of (spatial)
 #'  Bayesian brain mapping.
 #'
-#' @param bMap Fitted (spatial) Bayesian brain map from \code{\link{BrainMap}}.
+#' @param bMap Fitted (spatial) Bayesian brain map from \code{\link{fit_BBM}}.
 #' @param u,z Set a threshold value for engagement? A threshold value can be
 #'  specified directly with \code{u}, or a z-score-like threshold in terms of
 #'  standard deviations (the SD of values in the mean prior) can be specified
-#'  with \code{z}. Only one type of threshold can be used. Default: \code{NULL}
-#'  (do not use a threshold). Either argument can also be a vector to test
+#'  with \code{z}. Only one type of threshold can be used. Default:
+#'  \code{z=2}. Set both \code{u} and \code{z} to \code{NULL} to not use a
+#'  threshold. Either \code{u} or \code{z} can also be a vector to test
 #'  multiple thresholds at once, as long as \code{type} is not \code{"!="}
 #'  (to ensure the engagement regions are successive subsets).
 #' @param alpha Significance level for hypothesis testing. Default: \code{0.01}.
@@ -17,8 +18,9 @@
 #'  value and then testing if they are greater than... .
 #' @param method_p If the input is a \code{"bMap.[format]"} model object, the
 #'  type of multiple comparisons correction to use for p-values, or \code{NULL}
-#'  for no correction. See \code{help(p.adjust)}. Default: \code{"BH"}
-#'  (Benjamini & Hochberg, i.e. the false discovery rate). Note that multiple
+#'  for no correction. Default: \code{"BH"} (Benjamini & Hochberg, i.e. the
+#'  false discovery rate). Another option is \code{"bonferroni"} correction.
+#'  See \code{help(p.adjust)} for the full list of options. Note that multiple
 #'  comparisons will account for data locations, but not networks.
 #' @param verbose If \code{TRUE}, display progress of algorithm. Default:
 #'  \code{FALSE}.
@@ -29,9 +31,10 @@
 #'  \code{FALSE}.
 #'
 #' @return A list containing engagement maps for each network, the joint and
-#'  marginal PPMs for each network, and the parameters used for computing
-#'  engagement. If the input represented CIFTI- or NIFTI-format data, then the
-#'  engagements maps will be formatted accordingly.
+#'  marginal PPMs for each network, masks of regions meeting the threshold(s) if
+#'  provided, and the parameters used for computing engagement. If the input
+#'  represented CIFTI- or NIFTI-format data, then the engagements maps will be
+#'  formatted accordingly.
 #'
 #'  Use \code{summary} to obtain information about the engagements results.
 #'  For CIFTI-format engagements, use \code{plot} to visualize the engagement
@@ -46,13 +49,17 @@
 #'
 #' @examples
 #' \dontrun{
-#'  engagements(bMap_result, alpha=.05, deviation=TRUE)
+#'  id_engagements(fit_BBM_result, alpha=.05, deviation=TRUE)
 #' }
-engagements <- function(
-  bMap, u=NULL, z=NULL, alpha=0.01,
+id_engagements <- function(
+  bMap, u=NULL, z=2, alpha=0.01,
   type=c(">", "abs >", "<", "!="),
-  method_p='BH',
+  method_p=c('BH', 'bonferroni'),
   verbose=FALSE, which.nets=NULL, deviation=FALSE){
+
+  if (length(method_p) == 2 && all(method_p == c('BH', 'bonferroni'))) {
+    method_p <- 'BH'
+  }
 
   # Setup ----------------------------------------------------------------------
   is_bMap <- inherits(bMap, "bMap.matrix") || inherits(bMap, "bMap.cifti") || inherits(bMap, "bMap.nifti")
@@ -104,7 +111,7 @@ engagements <- function(
 
   if (deviation) {
     if (!is.null(z)) { stop("`z` not compatible with `deviation==TRUE`.") }
-    if (u != 0) { warning("`u != 0` not advised for `deviation==TRUE`. Proceeding anyway.") }
+    if (any(u != 0)) { warning("`u != 0` not advised for `deviation==TRUE`. Proceeding anyway.") }
   }
 
   # Get needed metadata from `bMap`.
@@ -171,21 +178,29 @@ engagements <- function(
     if (verbose) { cat(eng_name[uu], ".\n") }
     uu_mat <- matrix(u_mat[uu,], nrow=nV, ncol=nL, byrow=TRUE)
 
+    bMap_diff <- bMap$s_mean - uu_mat
+    bMap_diff_dev <- bMap_diff - bMap$t_mean
+
+    thresholded <- switch(type,
+      `>`= bMap_diff_dev > 0,
+      `abs >`= abs(bMap_diff_dev) > 0,
+      `<` = bMap_diff_dev < 0,
+      `!=` = NULL
+    )
+
     # Spatial Bayesian brain map engagements -----------------------------------
     if (is_sbMap) {
       if(verbose) cat('Determining areas of engagements based on joint posterior distribution of latent fields\n')
 
+      Dinv_mu_s <- as.vector(
+        (if (deviation) { bMap_diff_dev } else { bMap_diff }) / bMap$t_var
+      )
+
       #identify areas of engagement in each network
       engaged <- jointPPM <- marginalPPM <- vars <- matrix(NA, nrow=nV, ncol=nL)
-
       for(q in which.nets){
         if(verbose) cat(paste0('.. network ',q,' (',which(which.nets==q),' of ',length(which.nets),') \n'))
         inds_q <- (1:nV) + (q-1)*nV
-        if(deviation){
-          Dinv_mu_s <-  (as.vector(bMap$s_mean) - as.vector(bMap$t_mean) - uu_mat)/as.vector(sqrt(bMap$t_var))
-        } else {
-          Dinv_mu_s <- (as.vector(bMap$s_mean) - uu_mat)/as.vector(sqrt(bMap$t_var))
-        }
 
         if(q==which.nets[1]) {
           #we scale mu by D^(-1) to use Omega for precision (actual precision of s|y is D^(-1) * Omega * D^(-1) )
@@ -207,20 +222,18 @@ engagements <- function(
       if (length(unique(u))==1) { u <- u[1] }
       if (length(unique(z))==1) { z <- z[1] }
       out[[uu]] <- list(
-        engaged=engaged, jointPPM=jointPPM, marginalPPM=marginalPPM, vars=vars
+        engaged=engaged, jointPPM=jointPPM, marginalPPM=marginalPPM, vars=vars,
+        thresholded=thresholded
       )
     }
 
-    # Bayesian brain mapping engagements -------------------------------------------------
+    # Bayesian brain mapping engagements ---------------------------------------
     if (is_bMap) {
       if(verbose) cat('\tDetermining areas of engagements based on hypothesis testing at each location\n')
 
       nL <- ncol(bMap$s_mean)
-      if(deviation){
-        t_stat <- (as.matrix(bMap$s_mean) - bMap$t_mean - uu_mat) / as.matrix(bMap$s_se)
-      } else {
-        t_stat <- (as.matrix(bMap$s_mean) - uu_mat) / as.matrix(bMap$s_se)
-      }
+
+      t_stat <- (if (deviation) { bMap_diff_dev } else { bMap_diff }) / bMap$s_se
 
       if(type=='>') pvals <- 1-pnorm(t_stat)
       if(type=='<') pvals <- pnorm(t_stat)
@@ -238,7 +251,8 @@ engagements <- function(
       out[[uu]] <- list(
         engaged = engaged,
         pvals = pvals, pvals_adj = pvals_adj,
-        se = bMap$s_se, tstats = t_stat
+        se = bMap$s_se, tstats = t_stat,
+        thresholded = thresholded
       )
     }
   }
@@ -283,13 +297,24 @@ engagements <- function(
     names(engaged$meta$cifti$labels) <- netNames[which.nets]
   }
 
-  result <- c(
-    list(engaged=engaged),
-    out,
-    list(params=list(
+  for (uu in seq(nU)) {
+    for (aa in seq(length(out[[uu]]))) {
+      colnames(out[[uu]][[aa]]) <- netNames
+    }
+  }
+
+  result <- list(
+    engaged=engaged,
+    engaged_mat=abind(lapply(out, '[[', "engaged"), along=3),
+    pvals=abind(lapply(out, '[[', "pvals"), along=3),
+    pvals_adj=abind(lapply(out, '[[', "pvals_adj"), along=3),
+    se=abind(lapply(out, '[[', "se"), along=3),
+    tstats=abind(lapply(out, '[[', "tstats"), along=3),
+    thresholded=abind(lapply(out, '[[', "thresholded"), along=3),
+    params=list(
       alpha=alpha, method_p=method_p, type=type, u=u, z=z,
       which.nets=which.nets, deviation=deviation
-    ))
+    )
   )
 
   if (FORMAT == "CIFTI") {

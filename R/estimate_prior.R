@@ -18,7 +18,7 @@
 #'  There are two version of the variance prior: \code{varUB} gives the
 #'  unbiased variance estimate, and \code{varNN} gives the upwardly-biased
 #'  non-negative variance estimate. Values in \code{varUB} will need to be
-#'  clamped above zero before using in \code{BrainMap}.
+#'  clamped above zero before using in \code{\link{fit_BBM}}.
 #'
 #' @importFrom fMRItools var_decomp
 #' @keywords internal
@@ -115,36 +115,181 @@ estimate_prior_from_DR_two <- function(DR1, DR2){
   prior
 }
 
-#' Estimate FC prior
+#' Estimate empirical FC prior
 #'
 #' @param FC0 The FC estimates from \code{\link{estimate_prior}}.
-#' @param nu_adjust Factor by which to adjust estimate of nu.  Values < 1 will
-#' inflate the prior variance to avoid an over-informative prior on FC.
-#' @importFrom matrixStats colVars
 #' @keywords internal
-estimate_prior_FC <- function(FC0, nu_adjust=1){
-
+estimate_prior_FC_empirical <- function(FC0, nu_adjust=1){
   nL <- dim(FC0)[3]
   stopifnot(nL == dim(FC0)[4])
 
   FC1 <- FC0[1,,,]; FC2 <- FC0[2,,,]
-  FCavg <- (FC1 + FC2)/2
-  mean_FC <- apply(FCavg, c(2,3), mean, na.rm=TRUE)
-  var_FC_between <- apply(FCavg, c(2,3), var, na.rm=TRUE) #this may be an overestimate but that's ok
-  # mean_FC <- (colMeans(FC1, na.rm=TRUE) + colMeans(FC2, na.rm=TRUE)) / 2
-  # var_FC_tot  <- (apply(FC1, c(2, 3), var, na.rm=TRUE) + apply(FC2, c(2, 3), var, na.rm=TRUE))/2
-  # #var_FC_within  <- 1/2*(apply(FC1-FC2, c(2, 3), var, na.rm=TRUE))
-  # var_FC_between <- var_FC_tot # var_FC_within #to avoid under-estimating the variance, given that within-subject variance in FC is often high
-  # var_FC_between[var_FC_between < 0] <- NA
+  FC_avg <- (FC1 + FC2)/2
+  FC_mean <- apply(FC_avg, c(2,3), mean, na.rm=TRUE)
+  FC_var <- apply(FC_avg, c(2,3), var, na.rm=TRUE) #this may be an overestimate but that's ok
+  # FC_mean <- (colMeans(FC1, na.rm=TRUE) + colMeans(FC2, na.rm=TRUE)) / 2
+  # FC_var_tot  <- (apply(FC1, c(2, 3), var, na.rm=TRUE) + apply(FC2, c(2, 3), var, na.rm=TRUE))/2
+  # #FC_var_within  <- 1/2*(apply(FC1-FC2, c(2, 3), var, na.rm=TRUE))
+  # FC_var <- FC_var_tot # FC_var_within #to avoid under-estimating the variance, given that within-subject variance in FC is often high
+  # FC_var[FC_var < 0] <- NA
 
-  nu_est <- estimate_nu(var_FC_between, mean_FC)
+  list(mean = FC_mean, var = FC_var)
+}
+
+#' Estimate IW FC prior
+#'
+#' @param FC_mean_emp Empirical FC mean estimate
+#' @param FC_var_emp Empirical FC variance estimate
+#' @param nu_adjust Factor by which to adjust estimate of nu.  Values < 1 will
+#'  inflate the prior variance to avoid an over-informative prior on FC.
+#' @keywords internal
+estimate_prior_FC_IW <- function(FC_mean_emp, FC_var_emp, nL, nQ, nu_adjust=1) {
+  nu_est <- estimate_nu(FC_var_emp, FC_mean_emp)
   nu_est <- max(nL+4, nu_est*nu_adjust)
+  psi = FC_mean_emp*(nu_est - nL - 1)
 
-  list(nu = nu_est,
-       psi = mean_FC*(nu_est - nL - 1),
-       mean_empirical = mean_FC,
-       var_empirical = var_FC_between)
+  FC_mean_IW <- psi/(nu_est - nQ - 1)
+  FC_var_IW <- FC_mean_IW*0
+  nQ <- ncol(FC_mean_IW)
+  for (q1 in seq(nQ)) {
+    for (q2 in seq(nQ)) {
+      FC_var_IW[q1, q2] <- IW_var(
+        nu_est, nQ,
+        FC_mean_IW[q1,q2], FC_mean_IW[q1,q1], FC_mean_IW[q2,q2]
+      )
+    }
+  }
+  diag(FC_mean_IW) <- diag(FC_var_IW) <- NA
 
+  list(mean = FC_mean_IW, var = FC_var_IW, nu=nu_est, psi=psi)
+}
+
+#' Estimate Cholesky FC prior
+#'
+#' @param FC_nPivots,nL,FC0,FC_nSamp2 The parameters
+#' @keywords internal
+#' @importFrom stats complete.cases
+estimate_prior_FC_Chol <- function(FC_nPivots, nL, FC0, FC_nSamp2, verbose) {
+
+  pivots <- Chol_samp <- Chol_svd <- vector("list", FC_nPivots)
+  for (pp in seq(FC_nPivots)) {
+    pivots[[pp]] <- sample(1:nL, nL, replace = FALSE)
+  }
+
+  if (verbose) { cat("\nGenerating samples for Cholesky-based FC prior.\n") }
+
+  FC_samp_list <- NULL #collect FC samples to compute mean/var at end
+
+  #do Cholesky-based FC prior sampling
+  FC_samp_logdet <- NULL
+  FC_samp_cholinv <- vector('list', length = FC_nPivots)
+
+  #setup
+  nUT <- nL*(nL+1)/2 #number of upper triangular elements
+  Chol_mat_blank <- matrix(0, nL, nL)
+  Chol_mat_blank[upper.tri(Chol_mat_blank, diag=TRUE)] <- 1:nUT #indices of UT elements
+  chol_diag <- diag(Chol_mat_blank) #which Cholesky UT elements are on the diagonal
+  chol_offdiag <- Chol_mat_blank[upper.tri(Chol_mat_blank, diag=FALSE)] #which Cholesky UT elements are on the diagonal
+
+  #for each pivot: (steps 1-4 performed by Chol_samp function)
+  #1. perform Cholesky on each session, transform values to real line
+  #2. vectorize and perform SVD (save D, V and sd(U) for each pivot to facilitate additional sampling)
+  #3. draw FC_nSamp2 samples, construct Cholesky elements, and reverse transform
+  #4. rescale values to correspond to a correlation matrix
+  #5. for each sample, compute log determinant and inverse
+      # a) log|X| = 2*sum(log(diag(L))), where L is the upper or lower triangular Cholesky matrix
+      # b) a'X^(-1)a can be written b'b, where b = R_p^(-T)*P*a, where R_p is the upper triangular Cholesky matrix
+  count_pivot_fails <- 0
+  pivot_failures <- c()
+  for(pp in 1:FC_nPivots){
+    # count errors in chol
+    counter_env <- new.env()
+    counter_env$count <- 0
+
+    #perform Cholesky decomposition on each matrix in FC0 --> dim(FC0) = c(nM, nN, nL, nL)
+    Chol_p <- apply(FC0, 1:2, function(x, pivot){ # dim = nChol x nM x nN
+      xp <- x[pivot,pivot]
+      # chol will return an error when there are NAs in FCO or when there is any rank deficiency in one of the sessions
+      # if error, return NA instead
+      tryCatch({
+        chol_xp <- chol(xp)
+        chol_xp[upper.tri(chol_xp, diag = TRUE)]
+      }, error = function(e) {
+        counter_env$count <- counter_env$count + 1
+        rep(NA_real_, length(xp[upper.tri(xp, diag = TRUE)]))
+      })
+    }, pivot = pivots[[pp]])
+
+    if (counter_env$count > 0) {
+      count_pivot_fails <- count_pivot_fails + 1
+      pivot_failures <- c(pivot_failures, counter_env$count)
+    }
+
+    #rbind across sessions to form a matrix
+    Chol_mat_p <- rbind(t(Chol_p[,1,]), t(Chol_p[,2,])) # dim = nM*nN x nChol
+    # remove all rows with NA before calling Chol_samp_fun
+    Chol_mat_p <- Chol_mat_p[stats::complete.cases(Chol_mat_p), ]
+
+    #take samples
+    Chol_samp_pp <- Chol_samp_fun(Chol_mat_p, p=pivots[[pp]], M=FC_nSamp2,
+                              chol_diag, chol_offdiag, Chol_mat_blank) #returns a nSamp2 x nChol matrix
+    Chol_samp[[pp]] <- Chol_samp_pp$Chol_samp
+    Chol_svd[[pp]] <- Chol_samp_pp$chol_svd
+    FC_samp_list <- c(FC_samp_list, Chol_samp_pp$FC_samp_list)
+
+    # 5(a) compute the log(det(FC)) for each pivoted Cholesky sample
+    logdet_p <- 2 * rowSums(log(Chol_samp[[pp]][,chol_diag])) #log(det(X)) = 2*sum(log(diag(R)))
+    FC_samp_logdet <- c(FC_samp_logdet, logdet_p)
+
+    # 5(b) compute the inverse of each pivoted Cholesky sample
+    # If chol_inv is the inverse of the pivoted UT cholesky matrix,
+    # then chol_inv[op,] %*% t(chol_inv[op,]) gives inv(FC), where op = order(pivot)
+    op <- order(pivots[[pp]])
+    FC_samp_cholinv[[pp]] <- t(apply(Chol_samp[[pp]], 1, function(x){
+      x_mat <- UT2mat(x, LT=0) #form into a matrix (upper triangular)
+      x_mat_inv <- backsolve(x_mat, diag(nL)) #take the inverse of an UT matrix fast
+      #x_mat_inv_reo <- x_mat_inv[op,] #if we reverse the pivot -- no longer upper triangular!  so we will need to do this later.
+      x_mat_inv[upper.tri(x_mat_inv, diag=TRUE)] #the inverse of an UT matrix is also upper triangular
+    }, simplify=TRUE)) #this is extremely fast
+
+  } #end loop over pivots
+
+  #compute mean across FC samples
+  M_all <- FC_nPivots*FC_nSamp2 #total number of samples
+  FC_samp_mean <- Reduce("+", FC_samp_list)/M_all #mean of FC
+  FC_samp_var <- Reduce("+", lapply(FC_samp_list, function(x){ (x - FC_samp_mean)^2 }))/M_all #var of FC
+
+  # Compute the maximum eigenvalue of each FC^(-1) (same as 1 / min eigenvalue of each FC sample)
+  FC_samp_maxeig <- sapply(FC_samp_list, function(x){
+    vals <- eigen(x, only.values = TRUE)$values
+    return(1/min(vals))
+  })
+
+  if (length(pivot_failures) > 0) {
+    mean_failures_per_failed_pivot <- mean(pivot_failures)
+    min_failures_per_failed_pivot <- min(pivot_failures)
+    max_failures_per_failed_pivot <- max(pivot_failures)
+  } else {
+    mean_failures_per_failed_pivot <- 0
+    min_failures_per_failed_pivot <- 0
+    max_failures_per_failed_pivot <- 0
+  }
+  if (verbose) {
+    cat("\n--- Cholesky Error Summary ---\n")
+    cat("Number of pivots with any failures:", count_pivot_fails, "/", FC_nPivots, "\n")
+    cat("Failures per failed pivot - mean:", mean_failures_per_failed_pivot, "| range:", min_failures_per_failed_pivot, "to", max_failures_per_failed_pivot, "\n")
+  }
+
+  list(
+    mean = FC_samp_mean,
+    var = FC_samp_var,
+    Chol_samp = Chol_samp, #pivoted Cholesky factors for every sample
+    FC_samp_logdet = FC_samp_logdet, #log determinant values for every sample
+    FC_samp_cholinv = FC_samp_cholinv, #pivoted Cholesky inverses for every sample
+    FC_samp_maxeig = FC_samp_maxeig, #maximum eigenvalue of inverse FC samples
+    Chol_svd = Chol_svd,
+    pivots = pivots #need to use these along with FC_samp_cholinv to determine inv(FC)
+  )
 }
 
 #' Cholesky-based FC sampling
@@ -156,6 +301,7 @@ estimate_prior_FC <- function(FC0, nu_adjust=1){
 #' @param chol_offdiag Indices of off-diagonal upper triangular elements
 #' @param Chol_mat_blank A nLxnL matrix indexing the upper triangular elements
 #' @importFrom fMRItools UT2mat
+#' @importFrom matrixStats colVars
 #' @importFrom stats rnorm
 Chol_samp_fun <- function(Chol_vals, p, M, chol_diag, chol_offdiag, Chol_mat_blank){
 
@@ -393,6 +539,8 @@ Chol_samp_fun <- function(Chol_vals, p, M, chol_diag, chol_offdiag, Chol_mat_bla
 #' estimation.  Set to zero to skip Cholesky-based FC prior estimation. Default: 100.
 #' @param FC_nSamp Number of FC matrix samples to generate across all pivots. This
 #' should be a multiple of FC_nPivots.
+#' @param FC_updateA Update the timecourses before computing FC? Default:
+#'  \code{FALSE}. Only applies if \code{FC}.
 #' @param varTol Tolerance for variance of each data location. For each scan,
 #'  locations which do not meet this threshold are masked out of the analysis.
 #'  Default: \code{1e-6}. Variance is calculated on the original data, before
@@ -421,7 +569,7 @@ Chol_samp_fun <- function(Chol_vals, p, M, chol_diag, chol_offdiag, Chol_mat_bla
 #'  \code{wb_path} must also be provided.
 #' @param verbose Display progress updates? Default: \code{TRUE}.
 #'
-#' @importFrom stats cov quantile complete.cases
+#' @importFrom stats cov quantile
 #' @importFrom fMRItools is_1 is_integer is_posNum colCenter unmask_mat infer_format_ifti_vec all_binary
 #' @importFrom abind abind
 #'
@@ -483,6 +631,7 @@ estimate_prior <- function(
   FC=TRUE,
   FC_nPivots=100,
   FC_nSamp=50000,
+  FC_updateA=FALSE,
   varTol=1e-6,
   maskTol=.1,
   missingTol=.1,
@@ -493,6 +642,7 @@ estimate_prior <- function(
   # Check arguments ------------------------------------------------------------
 
   # Simple argument checks.
+  if (missing(template)) { stop("Please provide `template`.") }
   if (is.null(scale) || isFALSE(scale)) { scale <- "none" }
   if (isTRUE(scale)) {
     warning(
@@ -533,6 +683,11 @@ estimate_prior <- function(
     nC <- 0
   }
   stopifnot(fMRItools::is_1(FC, "logical"))
+  stopifnot(fMRItools::is_1(FC_updateA, "logical"))
+  if (!FC && FC_updateA) {
+    message("`FC_updateA` only applicable if `FC`. Setting `FC_updateA` to `FALSE`.")
+    FC_updateA <- FALSE
+  }
   stopifnot(fMRItools::is_1(varTol, "numeric"))
   if (varTol < 0) { message("Setting `varTol=0`."); varTol <- 0 }
   stopifnot(fMRItools::is_posNum(maskTol, zero_ok=TRUE))
@@ -763,6 +918,14 @@ estimate_prior <- function(
       nL <- nQ
     }
   }
+  # If updating `A` estimates for FC calculation, we need all networks'
+  #   estimated mean priors.
+  if (FC_updateA) {
+    inds2 <- inds
+    nL2 <- nL
+    inds <- seq(nQ)
+    nL <- nQ
+  }
 
   # [TO DO]: NA in template?
 
@@ -890,17 +1053,20 @@ estimate_prior <- function(
   # Initialize Cholesky pivots for Chol-based FC prior ---------------------
   if (FC) {
     if(FC_nPivots > 0){
-      pivots <- Chol_samp <- Chol_svd <- vector('list', length=FC_nPivots)
       FC_nSamp2 <- round(FC_nSamp/FC_nPivots) #number of samples per pivot
-      for(pp in 1:FC_nPivots){
-        pivots[[pp]] <- sample(1:nL, nL, replace = FALSE)
-      }
     }
-  } #end setup for FC prior estimation
-
+  }
+  if (!FC_updateA) {
+    FC_updateA_path_ii <- NULL # will be changed for each ii if `FC_updateA`
+  }
 
   if (usePar) {
     check_parallel_packages()
+
+    if (FC_updateA) { 
+      FC_updateA_path <- tempfile(pattern="FC_updateA_", tmpdir=tempdir(check=TRUE))
+      dir.create(FC_updateA_path)
+    }
 
     # Loop over subjects.
     `%dopar%` <- foreach::`%dopar%`
@@ -916,16 +1082,21 @@ estimate_prior <- function(
 
       # Initialize output.
       out <- list(DR=array(NA, dim=c(nM, 1, nL, nV)))
-      if (FC) {
-        out$FC <- array(NA, dim=c(nM, 1, nL, nL))
-       } #end setup for FC prior estimation
+      if (FC && !FC_updateA) { out$FC <- array(NA, dim=c(nM, 1, nL, nL)) }
       out$sigma_sq <- array(NA, dim=c(nM, 1, nV))
+      out$DR_ok <- FALSE
 
       # Dual regression.
       if(verbose) { cat(paste0(
         '\nSubject ', ii,' of ', nN, ".\n"
       )) }
       if (real_retest) { B2 <- BOLD2[[ii]] } else { B2 <- NULL }
+
+      if (FC_updateA) {
+        FC_updateA_path_ii <- file.path(FC_updateA_path, ii)
+        dir.create(FC_updateA_path_ii)
+      }
+
       DR_ii <- try(dual_reg2(
         BOLD[[ii]], BOLD2=B2,
         format=format,
@@ -941,6 +1112,7 @@ estimate_prior <- function(
         hpf=hpf, TR=TR,
         Q2=Q2, Q2_max=Q2_max,
         brainstructures=brainstructures, resamp_res=resamp_res,
+        FC_updateA_path=FC_updateA_path_ii,
         varTol=varTol, maskTol=maskTol,
         verbose=verbose
       ))
@@ -957,11 +1129,12 @@ estimate_prior <- function(
         ))
         if (ii==1) { message(DR_ii); stop("Error on first subject. Check data?") }
       } else {
-        out$DR[1,,,] <- DR_ii$test$S[inds,]
-        out$DR[2,,,] <- DR_ii$retest$S[inds,]
-        if(FC) {
-          out$FC[1,,,] <- cov(DR_ii$test$A[,inds])
-          out$FC[2,,,] <- cov(DR_ii$retest$A[,inds])
+        out$DR_ok <- TRUE
+        out$DR[1,,,] <- DR_ii$test$S[inds,,drop=FALSE]
+        out$DR[2,,,] <- DR_ii$retest$S[inds,,drop=FALSE]
+        if (FC && !FC_updateA) {
+          out$FC[1,,,] <- cov(DR_ii$test$A[,inds,drop=FALSE])
+          out$FC[2,,,] <- cov(DR_ii$retest$A[,inds,drop=FALSE])
           #out$FC_chol[1,,] <- chol(out$FC[1,,,])[upper.tri(out$FC[1,,,], diag=TRUE)]
           #out$FC_chol[2,,] <- chol(out$FC[2,,,])[upper.tri(out$FC[2,,,], diag=TRUE)]
         }
@@ -973,8 +1146,9 @@ estimate_prior <- function(
     }
 
     # Aggregate.
+    DR_ok <- vapply(q, `[[`, FALSE, "DR_ok")
     DR0 <- abind::abind(lapply(q, `[[`, "DR"), along=2)
-    if (FC) {
+    if (FC && !FC_updateA) {
       FC0 <- abind::abind(lapply(q, `[[`, "FC"), along=2)
       #FC0_chol <- abind::abind(lapply(q, `[[`, "FC_chol"), along=2)
     }
@@ -985,10 +1159,15 @@ estimate_prior <- function(
 
   } else {
     # Initialize output.
+    DR_ok <- rep(FALSE, nN)
     DR0 <- array(NA, dim=c(nM, nN, nL, nV)) # measurements by subjects by components by locations
-    if(FC) {
+    if (FC && !FC_updateA) {
       FC0 <- array(NA, dim=c(nM, nN, nL, nL)) # for functional connectivity prior
       #FC0_chol <- array(NA, dim=c(nM, nN, nL*(nL+1)/2))
+    }
+    if (FC_updateA) { 
+      FC_updateA_path <- tempfile(pattern="FC_updateA_", tmpdir=tempdir(check=TRUE))
+      dir.create(FC_updateA_path)
     }
     sigma_sq0 <- array(NA, dim=c(nM, nN, nV))
 
@@ -997,6 +1176,11 @@ estimate_prior <- function(
         '\nSubject ', ii,' of ', nN, '.\n'
       )) }
       if (real_retest) { B2 <- BOLD2[[ii]] } else { B2 <- NULL }
+
+      if (FC_updateA) {
+        FC_updateA_path_ii <- file.path(FC_updateA_path, ii)
+        dir.create(FC_updateA_path_ii)
+      }
 
       DR_ii <- try(dual_reg2(
         BOLD[[ii]], BOLD2=B2,
@@ -1013,6 +1197,7 @@ estimate_prior <- function(
         hpf=hpf, TR=TR,
         Q2=Q2, Q2_max=Q2_max,
         brainstructures=brainstructures, resamp_res=resamp_res,
+        FC_updateA_path=FC_updateA_path_ii,
         varTol=varTol, maskTol=maskTol,
         verbose=verbose
       ))
@@ -1029,11 +1214,12 @@ estimate_prior <- function(
         ))
         if (ii==1) { message(DR_ii); stop("Error on first subject. Check data?") }
       } else {
-        DR0[1,ii,,] <- DR_ii$test$S[inds,]
-        DR0[2,ii,,] <- DR_ii$retest$S[inds,]
-        if(FC) {
-          FC0[1,ii,,] <- cov(DR_ii$test$A[,inds])
-          FC0[2,ii,,] <- cov(DR_ii$retest$A[,inds])
+        DR_ok[ii] <- TRUE
+        DR0[1,ii,,] <- DR_ii$test$S[inds,,drop=FALSE]
+        DR0[2,ii,,] <- DR_ii$retest$S[inds,,drop=FALSE]
+        if (FC && !FC_updateA) {
+          FC0[1,ii,,] <- cov(DR_ii$test$A[,inds,drop=FALSE])
+          FC0[2,ii,,] <- cov(DR_ii$retest$A[,inds,drop=FALSE])
           if(!all(round(diag(FC0[1,ii,,]),6) == 1)) stop('var(A) should be 1 but it is not')
           if(!all(round(diag(FC0[2,ii,,]),6) == 1)) stop('var(A) should be 1 but it is not')
           #FC0_chol[1,ii,] <- chol(FC0[1,ii,,])[upper.tri(FC0[1,ii,,], diag=TRUE)]
@@ -1090,6 +1276,41 @@ estimate_prior <- function(
   prior$mean <- prior$mean / rescale #scale mean(S)
   prior[2:3] <- lapply(prior[2:3], function(x) return(x / (rescale^2)) ) #scale var(S)
   var_decomp <- lapply(var_decomp, function(x) return(x / (rescale^2) ) ) #scale var(S)
+  rm(rescale)
+
+  if (FC_updateA) {
+    FC0 <- array(NA, dim=c(nM, nN, nL2, nL2))
+    if (verbose ) { cat("\nUpdating timecourses for FC estimate.\n") }
+
+    for (ii in seq(nN)) {
+      if (!DR_ok[ii]) { next }
+      BOLD_old <- readRDS(file.path(FC_updateA_path, ii, "BOLDkeep.rds"))
+      A_updated_ii_1 <- fMRItools::dual_reg(
+        BOLD = BOLD_old$test,
+        GICA=prior$mean, scale="none", hpf=0, GSR=FALSE
+      )$A
+      A_updated_ii_2 <- fMRItools::dual_reg(
+        BOLD = BOLD_old$retest,
+        GICA=prior$mean, scale="none", hpf=0, GSR=FALSE
+      )$A
+      FC0[1,ii,,] <- cov(A_updated_ii_1[,inds2,drop=FALSE])
+      FC0[2,ii,,] <- cov(A_updated_ii_2[,inds2,drop=FALSE])
+    }
+
+    # Delete networks not in user-provided `inds`
+    #   subset `DR0`
+    DR0 <- array(DR0, dim=c(nM, nN, nL, nVm)) # Undo vectorize
+    DR0 <- DR0[,,nL2,,drop=FALSE]
+    DR0 <- array(DR0, dim=c(nM, nN, nL2*nVm)) # Redo vectorize
+    #   use provided `inds` rather than all networks
+    nL <- nL2; rm(nL2)
+    inds <- inds2; rm(inds2)
+    #   subset results
+    prior <- lapply(prior, function(mat){ mat[,inds,drop=FALSE] })
+    var_decomp <- lapply(var_decomp, function(mat){ mat[,inds,drop=FALSE] })
+
+    unlink(FC_updateA_path, recursive=TRUE)
+  }
 
   # Unmask the data matrices (relative to `mask2`, not `mask`).
   if (use_mask2) {
@@ -1097,128 +1318,23 @@ estimate_prior <- function(
     var_decomp <- lapply(var_decomp, fMRItools::unmask_mat, mask=mask2)
   }
 
-
-
   # Estimate FC prior
   if(FC){
 
     if (verbose) { cat("\nCalculating parametric FC prior.\n") }
 
-    prior$FC <- estimate_prior_FC(FC0) #estimate IW parameters
+    prior$FC <- list(empirical=NULL, IW=NULL, Chol=NULL)
 
-    #for Cholesky-based FC prior
-    FC_samp_list <- NULL #collect FC samples to compute mean/var at end
-    if(FC_nPivots > 0){
+    prior$FC$empirical <- estimate_prior_FC_empirical(FC0)
 
-      if (verbose) { cat("\nGenerating samples for Cholesky-based FC prior.\n") }
+    prior$FC$IW <- estimate_prior_FC_IW(
+      prior$FC$empirical$mean, prior$FC$empirical$var, nL, nQ
+    )
 
-      #do Cholesky-based FC prior sampling
-      FC_samp_logdet <- NULL
-      FC_samp_cholinv <- vector('list', length = FC_nPivots)
-
-      #setup
-      nUT <- nL*(nL+1)/2 #number of upper triangular elements
-      Chol_mat_blank <- matrix(0, nL, nL)
-      Chol_mat_blank[upper.tri(Chol_mat_blank, diag=TRUE)] <- 1:nUT #indices of UT elements
-      chol_diag <- diag(Chol_mat_blank) #which Cholesky UT elements are on the diagonal
-      chol_offdiag <- Chol_mat_blank[upper.tri(Chol_mat_blank, diag=FALSE)] #which Cholesky UT elements are on the diagonal
-
-      #for each pivot: (steps 1-4 performed by Chol_samp function)
-      #1. perform Cholesky on each session, transform values to real line
-      #2. vectorize and perform SVD (save D, V and sd(U) for each pivot to facilitate additional sampling)
-      #3. draw FC_nSamp2 samples, construct Cholesky elements, and reverse transform
-      #4. rescale values to correspond to a correlation matrix
-      #5. for each sample, compute log determinant and inverse
-          # a) log|X| = 2*sum(log(diag(L))), where L is the upper or lower triangular Cholesky matrix
-          # b) a'X^(-1)a can be written b'b, where b = R_p^(-T)*P*a, where R_p is the upper triangular Cholesky matrix
-      count_pivot_fails <- 0
-      pivot_failures <- c()
-      for(pp in 1:FC_nPivots){
-        # count errors in chol
-        counter_env <- new.env()
-        counter_env$count <- 0
-
-        #perform Cholesky decomposition on each matrix in FC0 --> dim(FC0) = c(nM, nN, nL, nL)
-        Chol_p <- apply(FC0, 1:2, function(x, pivot){ # dim = nChol x nM x nN
-          xp <- x[pivot,pivot]
-          # chol will return an error when there are NAs in FCO or when there is any rank deficiency in one of the sessions
-          # if error, return NA instead
-          tryCatch({
-            chol_xp <- chol(xp)
-            chol_xp[upper.tri(chol_xp, diag = TRUE)]
-          }, error = function(e) {
-            counter_env$count <- counter_env$count + 1
-            rep(NA_real_, length(xp[upper.tri(xp, diag = TRUE)]))
-          })
-        }, pivot = pivots[[pp]])
-
-        if (counter_env$count > 0) {
-          count_pivot_fails <- count_pivot_fails + 1
-          pivot_failures <- c(pivot_failures, counter_env$count)
-        }
-
-        #rbind across sessions to form a matrix
-        Chol_mat_p <- rbind(t(Chol_p[,1,]), t(Chol_p[,2,])) # dim = nM*nN x nChol
-        # remove all rows with NA before calling Chol_samp_fun
-        Chol_mat_p <- Chol_mat_p[stats::complete.cases(Chol_mat_p), ]
-
-        #take samples
-        Chol_samp_pp <- Chol_samp_fun(Chol_mat_p, p=pivots[[pp]], M=FC_nSamp2,
-                                 chol_diag, chol_offdiag, Chol_mat_blank) #returns a nSamp2 x nChol matrix
-        Chol_samp[[pp]] <- Chol_samp_pp$Chol_samp
-        Chol_svd[[pp]] <- Chol_samp_pp$chol_svd
-        FC_samp_list <- c(FC_samp_list, Chol_samp_pp$FC_samp_list)
-
-        # 5(a) compute the log(det(FC)) for each pivoted Cholesky sample
-        logdet_p <- 2 * rowSums(log(Chol_samp[[pp]][,chol_diag])) #log(det(X)) = 2*sum(log(diag(R)))
-        FC_samp_logdet <- c(FC_samp_logdet, logdet_p)
-
-        # 5(b) compute the inverse of each pivoted Cholesky sample
-        # If chol_inv is the inverse of the pivoted UT cholesky matrix,
-        # then chol_inv[op,] %*% t(chol_inv[op,]) gives inv(FC), where op = order(pivot)
-        op <- order(pivots[[pp]])
-        FC_samp_cholinv[[pp]] <- t(apply(Chol_samp[[pp]], 1, function(x){
-          x_mat <- UT2mat(x, LT=0) #form into a matrix (upper triangular)
-          x_mat_inv <- backsolve(x_mat, diag(nL)) #take the inverse of an UT matrix fast
-          #x_mat_inv_reo <- x_mat_inv[op,] #if we reverse the pivot -- no longer upper triangular!  so we will need to do this later.
-          x_mat_inv[upper.tri(x_mat_inv, diag=TRUE)] #the inverse of an UT matrix is also upper triangular
-        }, simplify=TRUE)) #this is extremely fast
-
-      } #end loop over pivots
-
-      #compute mean across FC samples
-      M_all <- FC_nPivots*FC_nSamp2 #total number of samples
-      FC_samp_mean <- Reduce("+", FC_samp_list)/M_all #mean of FC
-      FC_samp_var <- Reduce("+", lapply(FC_samp_list, function(x){ (x - FC_samp_mean)^2 }))/M_all #var of FC
-
-      # Compute the maximum eigenvalue of each FC^(-1) (same as 1 / min eigenvalue of each FC sample)
-      FC_samp_maxeig <- sapply(FC_samp_list, function(x){
-        vals <- eigen(x, only.values = TRUE)$values
-        return(1/min(vals))
-      })
-
-      prior$FC_Chol <- list(Chol_samp = Chol_samp, #pivoted Cholesky factors for every sample
-                               FC_samp_logdet = FC_samp_logdet, #log determinant values for every sample
-                               FC_samp_cholinv = FC_samp_cholinv, #pivoted Cholesky inverses for every sample
-                               FC_samp_maxeig = FC_samp_maxeig, #maximum eigenvalue of inverse FC samples
-                               FC_samp_mean = FC_samp_mean, #mean of FC samples
-                               FC_samp_var = FC_samp_var, #var of FC samples
-                               Chol_svd = Chol_svd,
-                               pivots = pivots) #need to use these along with FC_samp_cholinv to determine inv(FC)
-    } #end Cholesky-based FC prior estimation
-    if (length(pivot_failures) > 0) {
-      mean_failures_per_failed_pivot <- mean(pivot_failures)
-      min_failures_per_failed_pivot <- min(pivot_failures)
-      max_failures_per_failed_pivot <- max(pivot_failures) 
+    if (FC_nPivots > 0) {
+      prior$FC$Chol <- estimate_prior_FC_Chol(FC_nPivots, nL, FC0, FC_nSamp2, verbose)
     } else {
-      mean_failures_per_failed_pivot <- 0
-      min_failures_per_failed_pivot <- 0
-      max_failures_per_failed_pivot <- 0
-    }
-    if (verbose) {
-      cat("\n--- Cholesky Error Summary ---\n")
-      cat("Number of pivots with any failures:", count_pivot_fails, "/", FC_nPivots, "\n")
-      cat("Failures per failed pivot - mean:", mean_failures_per_failed_pivot, "| range:", min_failures_per_failed_pivot, "to", max_failures_per_failed_pivot, "\n")
+      prior$FC$Chol <- NULL
     }
   }
 
@@ -1269,7 +1385,7 @@ estimate_prior <- function(
   tparams <- list(
     FC=FC, FC_nPivots=FC_nPivots, FC_nSamp=FC_nSamp,
     num_subjects=nN, num_visits=nM,
-    inds=inds,
+    inds=inds, nQ=nQ,
     GSR=GSR, scale=scale,
     scale_sm_FWHM=scale_sm_FWHM,
     hpf=hpf, TR=TR,
