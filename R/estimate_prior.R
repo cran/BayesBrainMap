@@ -1,55 +1,40 @@
 #' Estimate prior from DR
 #'
-#' Estimate variance decomposition and priors from DR estimates.
-#'
-#' @param DR the test/retest dual regression estimates, as an array with
-#'  dimensions \eqn{M \times N \times (L \times V)}, where \eqn{M} is the number
-#'  of visits (2), \eqn{N} is the number of subjects, \eqn{L} is the number of
-#'  brain networks, and \eqn{V} is the number of data locations.
-#'
-#'  (\eqn{L} and \eqn{V} are collapsed because they are treated equivalently
-#'  in the context of calculating the variance decomposition and priors).
-#' @param LV A length-two integer vector giving the dimensions \eqn{L} and
-#'  \eqn{V} to reshape the result. Default: \code{NULL} (do not reshape the
-#'  result).
-#'
-#' @return List of two elements: the priors and the variance decomposition.
-#'
-#'  There are two version of the variance prior: \code{varUB} gives the
-#'  unbiased variance estimate, and \code{varNN} gives the upwardly-biased
-#'  non-negative variance estimate. Values in \code{varUB} will need to be
-#'  clamped above zero before using in \code{\link{fit_BBM}}.
-#'
 #' @importFrom fMRItools var_decomp
 #' @keywords internal
-estimate_prior_from_DR <- function(
-  DR, LV=NULL){
+estimate_prior_from_DR <- function(DR, LV=NULL){
 
   # Check arguments.
   stopifnot(length(dim(DR)) == 3)
   nM <- dim(DR)[1]  # visits
-  nN <- dim(DR)[2]  # subjects
+  # nN <- dim(DR)[2]  # subjects, including NA
   nLV <- dim(DR)[3] # locations & networks
   if (!is.null(LV)) {
-    stopifnot(is.numeric(nLV) && all(nLV > 0) && all(nLV == round(nLV)))
+    stopifnot(is.numeric(LV) && all(LV > 0))
     stopifnot(prod(LV) == nLV)
   }
 
-  # Variance decomposition
+  if (nM == 1) { stop("Only one visit.") }
+
+  # Variance decomposition. Subjects without complete data at a given
+  #   location/network are excluded there; `vd$nS` is the per-location count.
   vd <- var_decomp(DR)
 
+  # Need >= 2 subjects to estimate a variance.
+  nS <- vd$nS
+  nS[nS < 2] <- NA
+
   # Prior calculation
-  # Below true for M==2. Double check correct for M > 3? (Not used currently.)
-  MSB_divM <- (vd$SSB / (nN-1)) / nM
-  MSE_divM <- (vd$SSR / ((nM-1)*(nN-1))) / nM
+  MSB_divM <- (vd$SSB / (nS - 1)) / nM
+  MSE_divM <- (vd$SSR / ((nM - 1) * (nS - 1))) / nM
   prior <- list(
-    mean = vd$grand_mean,
+    mean  = vd$grand_mean,
     varUB = MSB_divM - MSE_divM,
     varNN = MSB_divM
   )
 
   # Format `vd`
-  vd$nM <- vd$nS <- vd$grand_mean <- NULL # Get rid of redundant entries
+  vd$nM <- vd$grand_mean <- NULL # Get rid of redundant entries
 
   ## Format `prior`: clamp var est above zero.
   # prior$varUB <- pmax(0, prior$varUB)
@@ -60,59 +45,10 @@ estimate_prior_from_DR <- function(
     vd <- lapply(vd, function(x){ matrix(x, nrow=LV[1], ncol=LV[2]) })
   }
 
-  # Return
+  # note: `var_decomp` and this function uses nS for number of subjects,
+  #   but elsewhere in this package it's nN.
+
   list(prior=prior, var_decomp=vd)
-}
-
-#' Estimate prior from DR estimates (when there are two measurements)
-#'
-#' Legacy version of \code{\link{estimate_prior_from_DR}}
-#'
-#' @param DR1,DR2 the test and retest dual regression estimates (\eqn{N \times L \times V})
-#'
-#' @return List of two elements: the mean and variance priors
-#' @keywords internal
-estimate_prior_from_DR_two <- function(DR1, DR2){
-
-  # Check arguments.
-  stopifnot(length(dim(DR1)) == length(dim(DR2)))
-  stopifnot(all(dim(DR1) == dim(DR2)))
-  N <- dim(DR1)[1]
-
-  prior <- list(mean=NULL, var=NULL)
-
-  # Mean.
-  prior$mean <- t(colMeans(DR1 + DR2, na.rm=TRUE) / 2)
-
-  # Variance.
-  SSB <- 2 * colSums(((DR1 + DR2)/2 - rep(t(prior$mean), each=N))^2, na.rm=TRUE)
-  prior$var_nn <- t(SSB / (N-1)) / 2 # MSB/2
-  # Unbiased.
-  # 1. Fastest method.
-  var_noise <- t( (1/2) * apply(DR1 - DR2, c(2,3), var, na.rm=TRUE) )
-  prior$var_ub <- prior$var_nn - var_noise/2
-
-  # # 2. Previous, equivalent calculation.
-  # var_tot1 <- apply(DR1, c(2,3), var, na.rm=TRUE)
-  # var_tot2 <- apply(DR2, c(2,3), var, na.rm=TRUE)
-  # var_tot <- t((var_tot1 + var_tot2)/2)
-  # # noise (within-subject) variance
-  # DR_diff <- DR1 - DR2;
-  # var_noise <- t((1/2)*apply(DR_diff, c(2,3), var, na.rm=TRUE))
-  # # signal (between-subject) variance
-  # prior$var <- var_tot - var_noise
-  #
-  # # 3. Another equivalent calculation.
-  # prior$var <- t(apply(
-  #   abind::abind(DR1, DR2, along=1),
-  #   seq(2, 3),
-  #   function(q){ cov(q[seq(N)], q[seq(N+1, 2*N)], use="complete.obs") }
-  # ))
-
-  # Make negative estimates equal to zero.
-  prior$var_ub[prior$var_ub < 0] <- 0
-
-  prior
 }
 
 #' Estimate empirical FC prior
@@ -437,23 +373,18 @@ Chol_samp_fun <- function(Chol_vals, p, M, chol_diag, chol_offdiag, Chol_mat_bla
 #'  calculating dual regression, not before. This is because removing the networks
 #'  prior to dual regression would leave unmodelled signals in the data, which
 #'  could bias the priors.
-#' @inheritParams scale_Param
-#' @param scale_sm_surfL,scale_sm_surfR,scale_sm_FWHM Only applies if
-#'  \code{scale=="local"} and \code{BOLD} represents surface data (CIFTI or
-#'  GIFTI). To smooth the standard deviation estimates used for local scaling,
-#'  provide the surface geometries along which to smooth as GIFTI geometry files
-#'  or \code{"surf"} objects, as well as the smoothing FWHM (default: \code{2}).
-#'
-#'  If \code{scale_sm_FWHM==0}, no smoothing of the local standard deviation
-#'  estimates will be performed.
-#'
-#'  If \code{scale_sm_FWHM>0} but \code{scale_sm_surfL} and
-#'  \code{scale_sm_surfR} are not provided, the default inflated surfaces from
-#'  the HCP will be used.
+#' @inheritParams scale_by_Param
+#' @inheritParams scale_sm_FWHM_Param
+#' @param scale_sm_surfL,scale_sm_surfR Required only for "local" smoothing
+#'  (see \code{scale_sm_FWHM}). To smooth the scale estimates, provide the 
+#'  surface geometries along which to smooth, as GIFTI geometry files or 
+#'  \code{ciftiTools} \code{"surf"} objects. The resolutions should match with
+#'  the \code{BOLD} data.
 #'
 #'  To create a \code{"surf"} object from data, see
-#'  \code{\link[ciftiTools]{make_surf}}. The surfaces must be in the same
-#'  resolution as the \code{BOLD} data.
+#'  \code{\link[ciftiTools]{make_surf}}.
+#' 
+#'  If not provided, the fs_LR "midthickness" surfaces will be used.
 #' @param nuisance (Optional) Nuisance matrices to regress from the BOLD data.
 #'  Should be a list of matrices, with time along the rows and nuisance signals
 #'  along the columns, where each entry corresponds to a \code{BOLD} session;
@@ -495,12 +426,6 @@ Chol_samp_fun <- function(Chol_vals, p, M, chol_diag, chol_offdiag, Chol_mat_bla
 #'  Default: \code{c("all")}.
 #' @param resamp_res Only applies if the entries of \code{BOLD} are CIFTI file paths.
 #'  Resample the data upon reading it in? Default: \code{NULL} (no resampling).
-#' @param mask Required if \code{BOLD} are NIFTI file paths or \code{"nifti"}
-#'  objects, and optional for other formats. For NIFTI data, this is a logical
-#'  array of the same spatial dimensions as the fMRI data, with \code{TRUE}
-#'  corresponding to in-mask voxels. For other data, this is a logical vector
-#'  with the same length as the number of locations in \code{template}, with
-#'  \code{TRUE} corresponding to in-mask locations.
 #' @param keep_S Keep the DR estimates of S? If \code{FALSE} (default), do not save
 #'  the DR estimates and only return the priors. If \code{TRUE}, the DR
 #'  estimates of S are returned too. If a single file path, save the DR estimates as
@@ -569,8 +494,8 @@ Chol_samp_fun <- function(Chol_vals, p, M, chol_diag, chol_offdiag, Chol_mat_bla
 #'  \code{wb_path} must also be provided.
 #' @param verbose Display progress updates? Default: \code{TRUE}.
 #'
-#' @importFrom stats cov quantile
-#' @importFrom fMRItools is_1 is_integer is_posNum colCenter unmask_mat infer_format_ifti_vec all_binary
+#' @importFrom stats cov quantile complete.cases
+#' @importFrom fMRItools is_1 is_integer is_posNum colCenter unmask_mat infer_format_ifti_vec all_binary var_decomp
 #' @importFrom abind abind
 #'
 #' @return A list: the \code{prior} and \code{var_decomp} with entries in
@@ -594,47 +519,36 @@ Chol_samp_fun <- function(Chol_vals, p, M, chol_diag, chol_offdiag, Chol_mat_bla
 #' mU <- matrix(rnorm(nV*nQ), nrow=nV)
 #' mS <- mU %*% diag(seq(nQ, 1)) %*% matrix(rnorm(nQ*nT), nrow=nQ)
 #' BOLD <- list(B1=mS, B2=mS, B3=mS)
-#' BOLD <- lapply(BOLD, function(x){x + rnorm(nV*nT, sd=.05)})
+#' BOLD <- lapply(BOLD, function(x){x + rnorm(nV*nT, mean = 100, sd=.05)})
 #' template <- mU
-#' estimate_prior(BOLD=BOLD, template=mU, FC_nSamp=2000, usePar=FALSE)
+#' estimate_prior(BOLD=BOLD, template=mU, FC_nSamp=2000, scale_sm_FWHM=0)
 #'
 #' \dontrun{
 #'  estimate_prior(
 #'    run1_cifti_fnames, run2_cifti_fnames,
 #'    gICA_cifti_fname, brainstructures="all",
-#'    scale="global", TR=0.71, Q2=NULL, varTol=10,
+#'    scale_sm_FWHM=Inf, TR=0.71, Q2=NULL, varTol=10,
 #'    usePar=FALSE
 #'  )
 #' }
 estimate_prior <- function(
   BOLD, BOLD2=NULL,
   template,
-  mask=NULL,
-  inds=NULL,
-  scale=c("local", "global", "none"),
-  scale_sm_surfL=NULL,
-  scale_sm_surfR=NULL,
-  scale_sm_FWHM=2,
-  nuisance=NULL,
-  scrub=NULL,
-  drop_first=0,
-  hpf=0,
-  TR=NULL,
+  mask=NULL, inds=NULL,
+  # dual_reg2 stuff ------------------------------------
+  drop_first=0, nuisance=NULL, scrub=NULL,
+  TR=NULL, hpf=NULL, #lpf=NULL,
   GSR=FALSE,
-  Q2=0,
-  Q2_max=NULL,
+  scale_by=c("mean", "sd", "none"),
+  scale_sm_FWHM=4, scale_sm_surfL=NULL, scale_sm_surfR=NULL,
+  Q2=0, Q2_max=NULL,
+  # end: dual_reg2 stuff -------------------------------
   covariates=NULL,
   brainstructures="all",
   resamp_res=NULL,
-  keep_S=FALSE,
-  keep_FC=FALSE,
-  FC=TRUE,
-  FC_nPivots=100,
-  FC_nSamp=50000,
-  FC_updateA=FALSE,
-  varTol=1e-6,
-  maskTol=.1,
-  missingTol=.1,
+  keep_S=FALSE, keep_FC=FALSE,
+  FC=TRUE, FC_nPivots=100, FC_nSamp=50000, FC_updateA=FALSE,
+  varTol=1e-6, maskTol=.1, missingTol=.1,
   usePar=FALSE,
   wb_path=NULL,
   verbose=TRUE) {
@@ -643,16 +557,15 @@ estimate_prior <- function(
 
   # Simple argument checks.
   if (missing(template)) { stop("Please provide `template`.") }
-  if (is.null(scale) || isFALSE(scale)) { scale <- "none" }
-  if (isTRUE(scale)) {
-    warning(
-      "Setting `scale='global'`. Use `'global'` or `'local'` ",
-      "instead of `TRUE`, which has been deprecated."
-    )
-    scale <- "global"
-  }
-  scale <- match.arg(scale, c("local", "global", "none"))
+  if (is.null(scale_by) || isFALSE(scale_by)) { scale_by <- "none" }
+  scale_by <- match.arg(scale_by, c("mean", "sd", "none"))
   stopifnot(fMRItools::is_1(scale_sm_FWHM, "numeric"))
+  ## `scale_sm` defines what kind of smoothing's being done.
+  scale_sm <- switch(
+    as.character(scale_sm_FWHM), 
+    "0"="none", "Inf"="global", "local"
+  )
+  if (scale_sm=="local") { stopifnot(scale_sm_FWHM > 0) }
   if (is.null(hpf)) { hpf <- 0 }
   if (is.null(TR)) {
     if (hpf==.01) {
@@ -748,6 +661,10 @@ estimate_prior <- function(
     } else {
       cluster <- parallel::makeCluster(nCores, outfile="")
       doParallel::registerDoParallel(cluster)
+      on.exit({
+        parallel::stopCluster(cluster)
+        foreach::registerDoSEQ()
+      }, add=TRUE)
     }
   }
 
@@ -789,32 +706,47 @@ estimate_prior <- function(
       rm(missing_BOLD2)
       if (all(missing_BOLD)) stop('Files in `BOLD` and/or `BOLD2` are missing such that no complete pair of data exists.')
     }
-    if (any(missing_BOLD)) {
+    if (any(missing_BOLD)) { # this block is written by Claude, read/verified by Damon
+      keep_B <- !missing_BOLD
       if (real_retest) {
         warning('There are ', sum(missing_BOLD), ' pairs of `BOLD` and `BOLD2` with at least one non-existent scan. These pairs will be excluded from prior estimation.')
-        BOLD <- BOLD[!missing_BOLD]
-        BOLD2 <- BOLD[!missing_BOLD]
+        BOLD <- BOLD[keep_B]
+        BOLD2 <- BOLD2[keep_B]
       } else {
         warning('There are ', sum(missing_BOLD), ' scans in `BOLD` that do not exist. These scans will be excluded from prior estimation.')
-        BOLD <- BOLD[!missing_BOLD]
+        BOLD <- BOLD[keep_B]
       }
+
+      # Subset `nuisance` and `scrub` too (must happen before their length checks).
+      subset_by_subj <- function(x) {
+        if (is.null(x)) { return(NULL) }
+        if (real_retest) {
+          stopifnot(is.list(x) && length(x)==2)
+          lapply(x, function(y) {
+            if (is.null(y)) { return(NULL) }
+            stopifnot(length(y) == length(keep_B))
+            y[keep_B]
+          })
+        } else {
+          stopifnot(length(x) == length(keep_B))
+          x[keep_B]
+        }
+      }
+      nuisance <- subset_by_subj(nuisance)
+      scrub <- subset_by_subj(scrub)
     }
   }
   nN <- length(BOLD)
 
   # Check `scale_sm_FWHM`
-  if (scale_sm_FWHM !=0 && FORMAT %in% c("NIFTI", "MATRIX")) {
-    if (scale_sm_FWHM==2) {
-      message("Setting `scale_sm_FWHM == 0`.\n")
+  if (scale_sm == "local" && FORMAT %in% c("NIFTI", "MATRIX")) {
+    scale_sm_FWHM <- 0; scale_sm <- "none"
+    if (FORMAT == "NIFTI") {
+      # [TO DO] make this available
+      warning( "Setting `scale_sm_FWHM == 0` (Scale smoothing not yet available for volumetric data. Contact developer.).\n")
     } else {
-      if (FORMAT == "NIFTI") {
-        # [TO DO] make this available
-        warning( "Setting `scale_sm_FWHM == 0` (Scale smoothing not available for volumetric data.).\n")
-      } else {
-        warning( "Setting `scale_sm_FWHM == 0` (Scale smoothing not available for data matrices: use CIFTI/GIFTI files.).\n")
-      }
+      warning( "Setting `scale_sm_FWHM == 0` (Scale smoothing not available for data matrices: use CIFTI/GIFTI files.).\n")
     }
-    scale_sm_FWHM <- 0
   }
 
   if (!is.null(nuisance)) {
@@ -825,7 +757,7 @@ estimate_prior <- function(
       stopifnot(is.list(nuisance[[1]]) && length(nuisance[[1]])==nN)
       stopifnot(is.list(nuisance[[2]]) && length(nuisance[[2]])==nN)
       # Remake into a length-nN list of length-2 lists
-      nuisance <- lapply(seq(nN), function(x){ list(nuisance[[1]][[nN]], nuisance[[2]][[nN]]) })
+      nuisance <- lapply(seq(nN), function(nn){ list(nuisance[[1]][[nn]], nuisance[[2]][[nn]]) })
     }
   }
 
@@ -837,7 +769,7 @@ estimate_prior <- function(
       stopifnot(is.list(scrub[[1]]) && length(scrub[[1]])==nN)
       stopifnot(is.list(scrub[[2]]) && length(scrub[[2]])==nN)
       # Remake into a length-nN list of length-2 lists
-      scrub <- lapply(seq(nN), function(x){ list(scrub[[1]][[nN]], scrub[[2]][[nN]]) })
+      scrub <- lapply(seq(nN), function(nn){ list(scrub[[1]][[nn]], scrub[[2]][[nn]]) })
     }
   }
 
@@ -948,7 +880,7 @@ estimate_prior <- function(
   if (FORMAT == "NIFTI") {
     if (is.null(mask)) { stop("`mask` is required.") }
     if (is.character(mask)) { mask <- RNifti::readNifti(mask); mask <- array(as.logical(mask), dim=dim(mask)) }
-    if (dim(mask)[length(dim(mask))] == 1) { mask <- array(mask, dim=dim(mask)[length(dim(mask))-1]) }
+    if (dim(mask)[length(dim(mask))] == 1) { mask <- array(mask, dim=dim(mask)[-length(dim(mask))]) }
     if (is.numeric(mask)) {
       message("Coercing `mask` to a logical array.\n")
       if (!fMRItools::all_binary(mask)) {
@@ -1051,11 +983,6 @@ estimate_prior <- function(
   nM <- 2
 
   # Initialize Cholesky pivots for Chol-based FC prior ---------------------
-  if (FC) {
-    if(FC_nPivots > 0){
-      FC_nSamp2 <- round(FC_nSamp/FC_nPivots) #number of samples per pivot
-    }
-  }
   if (!FC_updateA) {
     FC_updateA_path_ii <- NULL # will be changed for each ii if `FC_updateA`
   }
@@ -1063,7 +990,7 @@ estimate_prior <- function(
   if (usePar) {
     check_parallel_packages()
 
-    if (FC_updateA) { 
+    if (FC_updateA) {
       FC_updateA_path <- tempfile(pattern="FC_updateA_", tmpdir=tempdir(check=TRUE))
       dir.create(FC_updateA_path)
     }
@@ -1103,13 +1030,11 @@ estimate_prior <- function(
         template=template, template_parc_table=template_parc_table,
         mask=mask,
         keepA=FC,
+        drop_first=drop_first, nuisance=nuisance[[ii]], scrub=scrub[[ii]],
+        TR=TR, hpf=hpf,
         GSR=GSR,
-        scale=scale,
+        scale_by=scale_by, scale_sm_FWHM=scale_sm_FWHM,
         scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
-        scale_sm_FWHM=scale_sm_FWHM,
-        nuisance=nuisance[[ii]],
-        scrub=scrub[[ii]], drop_first=drop_first,
-        hpf=hpf, TR=TR,
         Q2=Q2, Q2_max=Q2_max,
         brainstructures=brainstructures, resamp_res=resamp_res,
         FC_updateA_path=FC_updateA_path_ii,
@@ -1154,9 +1079,6 @@ estimate_prior <- function(
     }
     sigma_sq0 <- abind::abind(lapply(q, `[[`, "sigma_sq"), along=2)
 
-
-    doParallel::stopImplicitCluster()
-
   } else {
     # Initialize output.
     DR_ok <- rep(FALSE, nN)
@@ -1165,7 +1087,7 @@ estimate_prior <- function(
       FC0 <- array(NA, dim=c(nM, nN, nL, nL)) # for functional connectivity prior
       #FC0_chol <- array(NA, dim=c(nM, nN, nL*(nL+1)/2))
     }
-    if (FC_updateA) { 
+    if (FC_updateA) {
       FC_updateA_path <- tempfile(pattern="FC_updateA_", tmpdir=tempdir(check=TRUE))
       dir.create(FC_updateA_path)
     }
@@ -1181,20 +1103,19 @@ estimate_prior <- function(
         FC_updateA_path_ii <- file.path(FC_updateA_path, ii)
         dir.create(FC_updateA_path_ii)
       }
-
+    
+      
       DR_ii <- try(dual_reg2(
         BOLD[[ii]], BOLD2=B2,
         format=format,
         template=template, template_parc_table=template_parc_table,
         mask=mask,
         keepA=FC,
+        drop_first=drop_first, nuisance=nuisance[[ii]], scrub=scrub[[ii]],
+        TR=TR, hpf=hpf,
         GSR=GSR,
-        scale=scale,
+        scale_by=scale_by, scale_sm_FWHM=scale_sm_FWHM,
         scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
-        scale_sm_FWHM=scale_sm_FWHM,
-        nuisance=nuisance[[ii]],
-        scrub=scrub[[ii]], drop_first=drop_first,
-        hpf=hpf, TR=TR,
         Q2=Q2, Q2_max=Q2_max,
         brainstructures=brainstructures, resamp_res=resamp_res,
         FC_updateA_path=FC_updateA_path_ii,
@@ -1250,7 +1171,7 @@ estimate_prior <- function(
     ) }
     DR0 <- DR0[,,,mask2,drop=FALSE]
     nVm <- sum(mask2)
-    sigma_sq0 <- sigma_sq0[,,mask2]
+    sigma_sq0 <- sigma_sq0[,,mask2,drop=FALSE]
   }
   # Note that `NA` values may still exist in `DR0`.
 
@@ -1268,6 +1189,9 @@ estimate_prior <- function(
   var_decomp <- lapply(x$var_decomp, t)
   rm(x)
 
+  nS_mat <- var_decomp$nS
+  var_decomp$nS <- NULL
+
   #rescale mean and variance of S to standardize residual var
   #rescaling residuals by \sigma_v implies that s_v rescaled in the same way
   #this is the same as rescaling mean(s_v) and var(s_v)
@@ -1275,32 +1199,55 @@ estimate_prior <- function(
   rescale <- matrix(rescale, nrow=length(sigma_sq0), ncol=nL)
   prior$mean <- prior$mean / rescale #scale mean(S)
   prior[2:3] <- lapply(prior[2:3], function(x) return(x / (rescale^2)) ) #scale var(S)
-  var_decomp <- lapply(var_decomp, function(x) return(x / (rescale^2) ) ) #scale var(S)
+  var_decomp <- lapply(var_decomp, function(x) return(x / (rescale^2) ))
   rm(rescale)
 
   if (FC_updateA) {
     FC0 <- array(NA, dim=c(nM, nN, nL2, nL2))
     if (verbose ) { cat("\nUpdating timecourses for FC estimate.\n") }
 
+    # Begin: written by Claude (fixed a bug) ----------------------
+    # [TO DO]: verify!
+    # (What Claude said about previous version):
+    # BOLDkeep is saved per subject with that subject's mask2 rows removed.
+    # prior$mean has the group-level mask2 rows (nVm).
+    # If any subject dropped locations, dual_reg gets mismatched BOLD and GICA.
+    # prior$mean can also contain NAs, which dual_reg rejects.
+    # You need to subset prior$mean to each subject's mask, or save the subject mask alongside BOLDkeep.
+
+    # Full-length (nV) template rows; NA where group-masked out.
+    GICA_full <- if (use_mask2) {
+      fMRItools::unmask_mat(prior$mean, mask=mask2)
+    } else {
+      prior$mean
+    }
+
     for (ii in seq(nN)) {
       if (!DR_ok[ii]) { next }
       BOLD_old <- readRDS(file.path(FC_updateA_path, ii, "BOLDkeep.rds"))
-      A_updated_ii_1 <- fMRItools::dual_reg(
-        BOLD = BOLD_old$test,
-        GICA=prior$mean, scale="none", hpf=0, GSR=FALSE
+
+      # Rows this subject kept, then drop rows where prior mean is NA.
+      G_ii <- GICA_full[BOLD_old$mask2,,drop=FALSE]
+      ok <- stats::complete.cases(G_ii)
+      G_ii <- G_ii[ok,,drop=FALSE]
+      Bt <- BOLD_old$test[ok,,drop=FALSE]
+      Br <- BOLD_old$retest[ok,,drop=FALSE]
+
+      A1 <- fMRItools::dual_reg(
+        BOLD=Bt, GICA=G_ii, scale_by="none", hpf=0, GSR=FALSE
       )$A
-      A_updated_ii_2 <- fMRItools::dual_reg(
-        BOLD = BOLD_old$retest,
-        GICA=prior$mean, scale="none", hpf=0, GSR=FALSE
+      A2 <- fMRItools::dual_reg(
+        BOLD=Br, GICA=G_ii, scale_by="none", hpf=0, GSR=FALSE
       )$A
-      FC0[1,ii,,] <- cov(A_updated_ii_1[,inds2,drop=FALSE])
-      FC0[2,ii,,] <- cov(A_updated_ii_2[,inds2,drop=FALSE])
+      FC0[1,ii,,] <- cov(A1[,inds2,drop=FALSE])
+      FC0[2,ii,,] <- cov(A2[,inds2,drop=FALSE])
     }
+    # End: written by Claude (fixed a bug) ------------------------
 
     # Delete networks not in user-provided `inds`
     #   subset `DR0`
     DR0 <- array(DR0, dim=c(nM, nN, nL, nVm)) # Undo vectorize
-    DR0 <- DR0[,,nL2,,drop=FALSE]
+    DR0 <- DR0[,,inds2,,drop=FALSE]
     DR0 <- array(DR0, dim=c(nM, nN, nL2*nVm)) # Redo vectorize
     #   use provided `inds` rather than all networks
     nL <- nL2; rm(nL2)
@@ -1385,11 +1332,13 @@ estimate_prior <- function(
   tparams <- list(
     FC=FC, FC_nPivots=FC_nPivots, FC_nSamp=FC_nSamp,
     num_subjects=nN, num_visits=nM,
-    inds=inds, nQ=nQ,
-    GSR=GSR, scale=scale,
-    scale_sm_FWHM=scale_sm_FWHM,
-    hpf=hpf, TR=TR,
-    Q2=Q2, Q2_max=Q2_max,
+    inds=inds,
+    drop_first=drop_first,
+    TR=TR, hpf=hpf,
+    GSR=GSR,
+    scale_by=scale_by, scale_sm_FWHM=scale_sm_FWHM,
+    scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
+    nQ=nQ, Q2=Q2, Q2_max=Q2_max,
     covariate_names=covariate_names,
     brainstructures=brainstructures, resamp_res=resamp_res,
     varTol=varTol, maskTol=maskTol, missingTol=missingTol,
@@ -1442,34 +1391,43 @@ estimate_prior <- function(
 #'
 estimate_prior.cifti <- function(
   BOLD, BOLD2=NULL,
-  template, inds=NULL,
-  scale=c("local", "global", "none"),
-  scale_sm_surfL=NULL, scale_sm_surfR=NULL, scale_sm_FWHM=2,
-  nuisance=NULL,
-  scrub=NULL,
-  drop_first=0,
-  hpf=0, TR=NULL,
+  template,
+  mask=NULL, inds=NULL,
+  # dual_reg2 stuff ------------------------------------
+  drop_first=0, nuisance=NULL, scrub=NULL,
+  TR=NULL, hpf=NULL, #lpf=NULL,
   GSR=FALSE,
+  scale_by=c("mean", "sd", "none"),
+  scale_sm_FWHM=4, scale_sm_surfL=NULL, scale_sm_surfR=NULL,
   Q2=0, Q2_max=NULL,
-  brainstructures="all", resamp_res=resamp_res,
+  # end: dual_reg2 stuff -------------------------------
+  covariates=NULL,
+  brainstructures="all",
+  resamp_res=NULL,
   keep_S=FALSE, keep_FC=FALSE,
-  FC=TRUE,
+  FC=TRUE, FC_nPivots=100, FC_nSamp=50000, FC_updateA=FALSE,
   varTol=1e-6, maskTol=.1, missingTol=.1,
-  usePar=FALSE, wb_path=NULL,
+  usePar=FALSE,
+  wb_path=NULL,
   verbose=TRUE) {
 
   estimate_prior(
     BOLD=BOLD, BOLD2=BOLD2,
-    template=template, inds=inds,
-    scale=scale, scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
-    scale_sm_FWHM=scale_sm_FWHM,
-    nuisance=nuisance, scrub=scrub, drop_first=drop_first,
-    hpf=hpf, TR=TR,
+    template=template, 
+    mask=mask, inds=inds,
+    # dual_reg2 stuff ------------------------------------
+    drop_first=drop_first, nuisance=nuisance, scrub=scrub,
+    TR=TR, hpf=hpf, #lpf=lpf,
     GSR=GSR,
+    scale_by=scale_by, scale_sm_FWHM=scale_sm_FWHM,
+    scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
     Q2=Q2, Q2_max=Q2_max,
-    brainstructures=brainstructures, resamp_res=resamp_res,
-    keep_S=keep_S,
-    FC=FC,
+    # end: dual_reg2 stuff -------------------------------
+    covariates=covariates,
+    brainstructures=brainstructures, 
+    resamp_res=resamp_res,
+    keep_S=keep_S, keep_FC=keep_FC,
+    FC=FC, FC_nPivots=FC_nPivots, FC_nSamp=FC_nSamp, FC_updateA=FC_updateA,
     varTol=varTol, maskTol=maskTol, missingTol=missingTol,
     usePar=usePar, wb_path=wb_path,
     verbose=verbose
@@ -1480,34 +1438,43 @@ estimate_prior.cifti <- function(
 #'
 estimate_prior.gifti <- function(
   BOLD, BOLD2=NULL,
-  template, inds=NULL,
-  scale=c("local", "global", "none"),
-  scale_sm_surfL=NULL, scale_sm_surfR=NULL, scale_sm_FWHM=2,
-  nuisance=NULL,
-  scrub=NULL,
-  drop_first=0,
-  hpf=0, TR=NULL,
+  template,
+  mask=NULL, inds=NULL,
+  # dual_reg2 stuff ------------------------------------
+  drop_first=0, nuisance=NULL, scrub=NULL,
+  TR=NULL, hpf=NULL, #lpf=NULL,
   GSR=FALSE,
+  scale_by=c("mean", "sd", "none"),
+  scale_sm_FWHM=4, scale_sm_surfL=NULL, scale_sm_surfR=NULL,
   Q2=0, Q2_max=NULL,
+  # end: dual_reg2 stuff -------------------------------
+  covariates=NULL,
   brainstructures="all",
-  keep_S=FALSE,keep_FC=FALSE,
-  FC=TRUE,
+  resamp_res=NULL,
+  keep_S=FALSE, keep_FC=FALSE,
+  FC=TRUE, FC_nPivots=100, FC_nSamp=50000, FC_updateA=FALSE,
   varTol=1e-6, maskTol=.1, missingTol=.1,
-  usePar=FALSE, wb_path=NULL,
+  usePar=FALSE,
+  wb_path=NULL,
   verbose=TRUE) {
 
   estimate_prior(
     BOLD=BOLD, BOLD2=BOLD2,
-    template=template, inds=inds,
-    scale=scale, scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
-    scale_sm_FWHM=scale_sm_FWHM,
-    nuisance=nuisance, scrub=scrub, drop_first=drop_first,
-    hpf=hpf, TR=TR,
+    template=template, 
+    mask=mask, inds=inds,
+    # dual_reg2 stuff ------------------------------------
+    drop_first=drop_first, nuisance=nuisance, scrub=scrub,
+    TR=TR, hpf=hpf, #lpf=lpf,
     GSR=GSR,
+    scale_by=scale_by, scale_sm_FWHM=scale_sm_FWHM,
+    scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
     Q2=Q2, Q2_max=Q2_max,
-    brainstructures=brainstructures,
-    keep_S=keep_S,
-    FC=FC,
+    # end: dual_reg2 stuff -------------------------------
+    covariates=covariates,
+    brainstructures=brainstructures, 
+    resamp_res=resamp_res,
+    keep_S=keep_S, keep_FC=keep_FC,
+    FC=FC, FC_nPivots=FC_nPivots, FC_nSamp=FC_nSamp, FC_updateA=FC_updateA,
     varTol=varTol, maskTol=maskTol, missingTol=missingTol,
     usePar=usePar, wb_path=wb_path,
     verbose=verbose
@@ -1518,35 +1485,45 @@ estimate_prior.gifti <- function(
 #'
 estimate_prior.nifti <- function(
   BOLD, BOLD2=NULL,
-  template, inds=NULL,
-  scale=c("local", "global", "none"),
-  nuisance=NULL,
-  scrub=NULL,
-  drop_first=0,
-  hpf=0, TR=NULL,
+  template,
+  mask=NULL, inds=NULL,
+  # dual_reg2 stuff ------------------------------------
+  drop_first=0, nuisance=NULL, scrub=NULL,
+  TR=NULL, hpf=NULL, #lpf=NULL,
   GSR=FALSE,
+  scale_by=c("mean", "sd", "none"),
+  scale_sm_FWHM=4, scale_sm_surfL=NULL, scale_sm_surfR=NULL,
   Q2=0, Q2_max=NULL,
-  mask=NULL,
-  keep_S=FALSE,keep_FC=FALSE,
-  FC=TRUE,
+  # end: dual_reg2 stuff -------------------------------
+  covariates=NULL,
+  brainstructures="all",
+  resamp_res=NULL,
+  keep_S=FALSE, keep_FC=FALSE,
+  FC=TRUE, FC_nPivots=100, FC_nSamp=50000, FC_updateA=FALSE,
   varTol=1e-6, maskTol=.1, missingTol=.1,
-  usePar=FALSE, wb_path=NULL,
+  usePar=FALSE,
+  wb_path=NULL,
   verbose=TRUE) {
 
   estimate_prior(
     BOLD=BOLD, BOLD2=BOLD2,
-    template=template, inds=inds,
-    scale=scale,
-    nuisance=nuisance, scrub=scrub, drop_first=drop_first,
-    hpf=hpf, TR=TR,
+    template=template, 
+    mask=mask, inds=inds,
+    # dual_reg2 stuff ------------------------------------
+    drop_first=drop_first, nuisance=nuisance, scrub=scrub,
+    TR=TR, hpf=hpf, #lpf=lpf,
     GSR=GSR,
+    scale_by=scale_by, scale_sm_FWHM=scale_sm_FWHM,
+    scale_sm_surfL=scale_sm_surfL, scale_sm_surfR=scale_sm_surfR,
     Q2=Q2, Q2_max=Q2_max,
-    mask=mask,
-    keep_S=keep_S,
-    FC=FC,
+    # end: dual_reg2 stuff -------------------------------
+    covariates=covariates,
+    brainstructures=brainstructures, 
+    resamp_res=resamp_res,
+    keep_S=keep_S, keep_FC=keep_FC,
+    FC=FC, FC_nPivots=FC_nPivots, FC_nSamp=FC_nSamp, FC_updateA=FC_updateA,
     varTol=varTol, maskTol=maskTol, missingTol=missingTol,
     usePar=usePar, wb_path=wb_path,
     verbose=verbose
   )
 }
-

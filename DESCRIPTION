@@ -2,12 +2,13 @@ Package: BayesBrainMap
 Type: Package
 Title: Estimate Brain Networks and Connectivity with Population-Derived
         Priors
-Version: 0.2.0
+Version: 0.3.1
 Authors@R: c(
     person(given = "Amanda",
            family = "Mejia",
            email = "mandy.mejia@gmail.com",
-           role = c("aut", "cre")),
+           role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0002-4312-8974")),
     person(given = "Damon",
            family = "Pham",
            email = "damondpham@gmail.com",
@@ -34,18 +35,19 @@ Depends: R (>= 3.6.0)
 License: GPL-3
 Additional_repositories: https://inla.r-inla-download.org/R/testing
 Encoding: UTF-8
-Imports: abind, fMRItools (>= 0.7.1), fMRIscrub (>= 0.14.5), foreach,
-        Matrix, matrixStats, methods, pesel, SQUAREM, stats, utils
+Imports: abind, fMRItools (>= 0.8.0), foreach, Matrix, matrixStats,
+        methods, pesel, SQUAREM, stats, utils
 Suggests: ciftiTools (>= 0.13.2), excursions, RNifti, oro.nifti, gifti,
         ggplot2, parallel, doParallel, knitr, rmarkdown, INLA, testthat
         (>= 3.0.0)
-RoxygenNote: 7.3.3
 URL: https://github.com/mandymejia/BayesBrainMap
 BugReports: https://github.com/mandymejia/BayesBrainMap/issues
+Config/roxygen2/version: 8.1.0
 NeedsCompilation: no
-Packaged: 2026-02-02 05:04:23 UTC; ddpham
-Author: Amanda Mejia [aut, cre],
+Packaged: 2026-10-01 13:29:26 UTC; damon
+Author: Amanda Mejia [aut, cre] (ORCID:
+    <https://orcid.org/0000-0002-4312-8974>),
   Damon Pham [aut] (ORCID: <https://orcid.org/0000-0001-7563-4727>),
   Nohelia Da Silva [ctb]
 Repository: CRAN
-Date/Publication: 2026-02-03 09:00:14 UTC
+Date/Publication: 2026-10-02 09:40:02 UTC
